@@ -1,6 +1,6 @@
 'use strict';
 
-const SD_VERSION = '0.2.1';
+const SD_VERSION = '0.2.2';
 const SD_WORKSPACE_GUID = 'WEJ9EZW6ADT58SJC3EQMNETSW6';
 const SD_TEMPLATES_COLLECTION_GUID = '1DEGAQTQARK8MKNAFZ9D1MY16W';
 const SD_SCRATCHPAD_COLLECTION_GUID = '1G8F9FFY4XFXKA2MBGE2FN39B3';
@@ -1577,6 +1577,14 @@ class Plugin extends AppPlugin {
       }
       state = await this._reverifyState(originalLine, discovery);
       verdict = await this._manualDeleteVerdict(state, discovery, options);
+      if (verdict.status === 'defuse' && verdict.reason === 'content' &&
+          deleteVerdict.empty === true && verdict.subtreeSize === 1 && deletedGuids.length > 0) {
+        // Our own deletions turned the tagged line into a leaf, so the leaf rule
+        // now reads its own text as content — but the original subtree-mode
+        // verdict already ruled that text out. Finish the planned delete. A REAL
+        // mid-sweep change (a new child) leaves subtreeSize > 1 and still aborts.
+        verdict = this._replaceVerdict(verdict, { status: 'delete', reason: 'empty-continue', empty: true });
+      }
       if (verdict.status !== 'delete') break;
       const freshRoot = state.fresh;
       if (!freshRoot) break;
