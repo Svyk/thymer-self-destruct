@@ -1,6 +1,6 @@
 {
   "name": "Self Destruct",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Dry-run-first self-destruct engine for expiring Thymer line subtrees.",
   "type": "app",
   "author": "Svyatoslav Kleshchev",

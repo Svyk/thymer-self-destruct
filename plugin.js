@@ -1,6 +1,6 @@
 'use strict';
 
-const SD_VERSION = '0.2.0';
+const SD_VERSION = '0.2.1';
 const SD_WORKSPACE_GUID = 'WEJ9EZW6ADT58SJC3EQMNETSW6';
 const SD_TEMPLATES_COLLECTION_GUID = '1DEGAQTQARK8MKNAFZ9D1MY16W';
 const SD_SCRATCHPAD_COLLECTION_GUID = '1G8F9FFY4XFXKA2MBGE2FN39B3';
@@ -1375,15 +1375,21 @@ class Plugin extends AppPlugin {
   }
 
   async _discover(report, context) {
-    const result = await this.data.searchByQuery('#sd', SD_SEARCH_LIMIT);
-    if (!result || result.error) {
+    // Hashtag search is EXACT-match per full tag ('#sd' does not find '#sd/now' —
+    // verified live 2026-07-31), so union the exact-tag query with a quoted literal
+    // text query; the strict segment re-filter below drops the literal query's
+    // false positives ('#sdk', prose mentions).
+    const exact = await this.data.searchByQuery('#sd', SD_SEARCH_LIMIT);
+    const literal = await this.data.searchByQuery('"#sd"', SD_SEARCH_LIMIT);
+    const failed = [exact, literal].find(result => !result || result.error);
+    if (failed !== undefined) {
       report.skipped = true;
       report.skipReason = 'search-error';
-      this._reportError(report, 'search', new Error('searchByQuery: ' + String(result && result.error || 'no result')), null, null);
+      this._reportError(report, 'search', new Error('searchByQuery: ' + String(failed && failed.error || 'no result')), null, null);
       return { lines: [], searchCapped: false, templateRecords: new Set(), logGuid: null };
     }
     const dedup = new Map();
-    for (const line of result.lines || []) {
+    for (const line of (exact.lines || []).concat(literal.lines || [])) {
       if (!line || !line.guid) continue;
       const strict = (line.segments || []).some(segment => segment && segment.type === 'hashtag' && typeof segment.text === 'string' && SD_TAG_RE.test(segment.text));
       if (strict && !dedup.has(line.guid)) dedup.set(line.guid, line);
@@ -1399,7 +1405,7 @@ class Plugin extends AppPlugin {
     const logRecord = await this._findLogRecord(false, context);
     return {
       lines: Array.from(dedup.values()),
-      searchCapped: (result.lines || []).length >= SD_SEARCH_LIMIT,
+      searchCapped: (exact.lines || []).length >= SD_SEARCH_LIMIT || (literal.lines || []).length >= SD_SEARCH_LIMIT,
       templateRecords,
       logGuid: logRecord && logRecord.guid || null,
     };
