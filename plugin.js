@@ -1,6 +1,6 @@
 'use strict';
 
-const SD_VERSION = '0.1.1';
+const SD_VERSION = '0.2.0';
 const SD_WORKSPACE_GUID = 'WEJ9EZW6ADT58SJC3EQMNETSW6';
 const SD_TEMPLATES_COLLECTION_GUID = '1DEGAQTQARK8MKNAFZ9D1MY16W';
 const SD_SCRATCHPAD_COLLECTION_GUID = '1G8F9FFY4XFXKA2MBGE2FN39B3';
@@ -23,6 +23,9 @@ const SD_LOG_GUID_KEY = 'self-destruct-log-guid-v1';
 const SD_RESURRECTED_KEY = 'self-destruct-resurrected-v1';
 const SD_RESURRECTED_MAX_AGE_MS = 30 * 86400000;
 const SD_RESURRECTED_LIMIT = 500;
+const SD_STYLE_ID = 'self-destruct-managed-style';
+const SD_CARET_POLL_MS = 400;
+const SD_CARET_STASH_MAX_AGE_MS = 3 * 60 * 1000;
 const SD_TAG_RE = /^#sd(?:\/|$)/i;
 const SD_KEEP_RE = /^#keep(?:\/|$)/i;
 const SD_SUMMARY_RE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}) — /;
@@ -338,13 +341,19 @@ function newReport(options) {
 class Plugin extends AppPlugin {
   onLoad() {
     window.__SD_VERSION = SD_VERSION;
+    let previousDashboardReport = null;
+    try { previousDashboardReport = window.__sdInstance && window.__sdInstance._dashboardReport || null; } catch (_) {}
     try { if (typeof window.__sdDispose === 'function') window.__sdDispose(); } catch (_) {}
     try { if (window.__sdInterval) clearInterval(window.__sdInterval); } catch (_) {}
     try { if (window.__sdFirstPass) clearTimeout(window.__sdFirstPass); } catch (_) {}
     try { if (window.__sdActivityHandler) ['keydown','beforeinput','input','pointerdown','compositionstart','wheel','touchstart','visibilitychange'].forEach(name => document.removeEventListener(name, window.__sdActivityHandler, true)); } catch (_) {}
     try { (window.__sdEventIds || []).forEach(id => this.events.off(id)); } catch (_) {}
     try { (window.__sdCommands || []).forEach(command => command && command.remove && command.remove()); } catch (_) {}
-    for (const key of ['__sdDispose','__sdInterval','__sdFirstPass','__sdActivityHandler','__sdEventIds','__sdCommands','__sdInstance']) { try { delete window[key]; } catch (_) {} }
+    try { if (window.__sdCaretHandler) { document.removeEventListener('mouseup', window.__sdCaretHandler); document.removeEventListener('keyup', window.__sdCaretHandler); } } catch (_) {}
+    try { if (window.__sdCaretPoll) clearInterval(window.__sdCaretPoll); } catch (_) {}
+    try { if (window.__sdStatusItem && window.__sdStatusItem.remove) window.__sdStatusItem.remove(); } catch (_) {}
+    try { if (typeof window.__sdModalCancel === 'function') window.__sdModalCancel(); } catch (_) {}
+    for (const key of ['__sdDispose','__sdInterval','__sdFirstPass','__sdActivityHandler','__sdEventIds','__sdCommands','__sdCaretHandler','__sdCaretPoll','__sdStatusItem','__sdModalCancel','__sdPanelMount','__sdInstance']) { try { delete window[key]; } catch (_) {} }
 
     console.log('%c[Self Destruct] v' + SD_VERSION + ' loaded — dry-run first, subtree-safe.', 'color:#ef4444;font-weight:700;font-size:12px');
     this.VERSION = SD_VERSION;
@@ -354,6 +363,11 @@ class Plugin extends AppPlugin {
     this._sweepPromise = null;
     this._eventIds = [];
     this._commands = [];
+    this._statusItem = null;
+    this._dashboardHosts = new Set();
+    this._dashboardReport = previousDashboardReport && previousDashboardReport.schemaVersion === 1 ? previousDashboardReport : null;
+    this._dashboardRefreshPromise = null;
+    this._caretStash = null;
     this._quietWaiters = new Set();
     this._resurrected = this._loadResurrected();
     this._settings = this._loadSettings();
@@ -366,7 +380,11 @@ class Plugin extends AppPlugin {
     } catch (_) {}
 
     this._initForensics();
+    window.__sdInstance = this;
     this._subscribeUndeletes();
+    this._installManagedStyle();
+    this._registerDashboard();
+    this._installCaretStash();
     this._registerCommands();
 
     this._sweepGlobal = () => this._requestSweep({ manual: true, dryRun: !!this._settings.dryRun, source: 'manual' });
@@ -380,13 +398,12 @@ class Plugin extends AppPlugin {
     }, SD_FIRST_PASS_MS);
     window.__sdEventIds = this._eventIds;
     window.__sdCommands = this._commands;
-    window.__sdInstance = this;
-    window.__sdDispose = () => this._dispose();
+    window.__sdDispose = () => this._dispose(false);
   }
 
-  onUnload() { this._dispose(); }
+  onUnload() { this._dispose(true); }
 
-  _dispose() {
+  _dispose(fullUnload) {
     if (this._disposed) return;
     this._disposed = true;
     try { if (window.__sdInterval) clearInterval(window.__sdInterval); } catch (_) {}
@@ -394,6 +411,16 @@ class Plugin extends AppPlugin {
     try { for (const name of this._activityEvents || []) document.removeEventListener(name, this._activityHandler, true); } catch (_) {}
     try { for (const id of this._eventIds || []) this.events.off(id); } catch (_) {}
     try { for (const command of this._commands || []) command && command.remove && command.remove(); } catch (_) {}
+    try { if (this._caretHandler) { document.removeEventListener('mouseup', this._caretHandler); document.removeEventListener('keyup', this._caretHandler); } } catch (_) {}
+    try { if (this._caretPoll) clearInterval(this._caretPoll); } catch (_) {}
+    try { if (this._statusItem && this._statusItem.remove) this._statusItem.remove(); } catch (_) {}
+    try { if (typeof this._modalCancel === 'function') this._modalCancel(); } catch (_) {}
+    for (const host of this._dashboardHosts || []) {
+      try { if (host.root && host.click) host.root.removeEventListener('click', host.click); } catch (_) {}
+      try { if (host.root && host.change) host.root.removeEventListener('change', host.change); } catch (_) {}
+      try { if (host.root && host.input) host.root.removeEventListener('input', host.input); } catch (_) {}
+    }
+    this._dashboardHosts && this._dashboardHosts.clear();
     for (const waiter of this._quietWaiters || []) {
       try { clearTimeout(waiter.timer); waiter.resolve(false); } catch (_) {}
     }
@@ -401,8 +428,9 @@ class Plugin extends AppPlugin {
     try { if (window.__SD_SWEEP === this._sweepGlobal) delete window.__SD_SWEEP; } catch (_) {}
     try { if (window.__SD_DRY === this._dryGlobal) delete window.__SD_DRY; } catch (_) {}
     if (typeof window !== 'undefined' && window.__sdInstance === this) {
-      for (const key of ['__sdDispose','__sdInterval','__sdFirstPass','__sdActivityHandler','__sdEventIds','__sdCommands','__sdInstance']) { try { delete window[key]; } catch (_) {} }
+      for (const key of ['__sdDispose','__sdInterval','__sdFirstPass','__sdActivityHandler','__sdEventIds','__sdCommands','__sdCaretHandler','__sdCaretPoll','__sdStatusItem','__sdModalCancel','__sdPanelMount','__sdInstance']) { try { delete window[key]; } catch (_) {} }
     }
+    if (fullUnload) { try { document.getElementById(SD_STYLE_ID)?.remove(); } catch (_) {} }
   }
 
   _loadSettings() {
@@ -479,8 +507,349 @@ class Plugin extends AppPlugin {
     } catch (error) { this._recordStandaloneError('subscribe', error, null, null); }
   }
 
+  _installManagedStyle() {
+    try {
+      let style = document.getElementById(SD_STYLE_ID);
+      if (!style) {
+        style = document.createElement('style');
+        style.id = SD_STYLE_ID;
+        (document.head || document.documentElement).appendChild(style);
+      }
+      style.textContent = `
+.sd-widget.sd-root { min-height:100%; box-sizing:border-box; padding:18px 20px 28px; background:var(--color-bg-900); color:var(--color-text-400); font-family:var(--font-family); }
+.sd-widget .sd-shell { max-width:920px; margin:0 auto; }
+.sd-widget .sd-header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:14px; }
+.sd-widget .sd-title { font-size:20px; line-height:1.2; font-weight:750; }
+.sd-widget .sd-meta { margin-top:5px; color:var(--color-text-600); font-size:11px; }
+.sd-widget .sd-badge { display:inline-flex; align-items:center; min-height:24px; padding:2px 9px; border:1px solid var(--enum-yellow-border); border-radius:999px; background:var(--enum-yellow-bg); color:var(--enum-yellow-fg); font-size:11px; font-weight:800; letter-spacing:.05em; }
+.sd-widget .sd-actions { display:flex; gap:7px; flex-wrap:wrap; margin-bottom:16px; }
+.sd-widget .sd-btn { border:1px solid var(--cards-border-color); border-radius:7px; padding:6px 10px; background:var(--button-bg-color); color:var(--color-text-400); font:inherit; font-size:12px; cursor:pointer; }
+.sd-widget .sd-btn:hover,.sd-widget .sd-btn:focus-visible { border-color:var(--button-primary-bg-color); outline:none; }
+.sd-widget .sd-btn-primary { border-color:var(--button-primary-bg-color); background:var(--button-primary-bg-color); color:var(--cards-bg); font-weight:650; }
+.sd-widget .sd-btn-danger:hover,.sd-widget .sd-btn-danger:focus-visible { border-color:var(--enum-red-border); color:var(--enum-red-fg); }
+.sd-widget .sd-banner { margin:7px 0; padding:8px 10px; border:1px solid var(--enum-yellow-border); border-radius:7px; background:var(--enum-yellow-bg); color:var(--enum-yellow-fg); font-size:12px; line-height:1.4; }
+.sd-widget .sd-banner-error { border-color:var(--enum-red-border); background:var(--enum-red-bg); color:var(--enum-red-fg); }
+.sd-widget .sd-section { margin-top:18px; }
+.sd-widget .sd-section-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px; }
+.sd-widget .sd-section-title { font-size:13px; font-weight:750; text-transform:uppercase; letter-spacing:.05em; }
+.sd-widget .sd-muted { color:var(--color-text-600); font-size:11px; }
+.sd-widget .sd-list { display:grid; gap:7px; }
+.sd-widget .sd-empty { padding:18px; border:1px dashed var(--cards-border-color); border-radius:9px; color:var(--color-text-600); text-align:center; font-size:12px; }
+.sd-widget .sd-row { display:grid; grid-template-columns:minmax(116px,auto) minmax(0,1fr) auto; align-items:center; gap:11px; min-height:48px; padding:8px 10px; border:1px solid var(--cards-border-color); border-radius:9px; background:var(--cards-bg); }
+.sd-widget .sd-row:hover { background:var(--sidebar-bg-hover); }
+.sd-widget .sd-chip { justify-self:start; padding:3px 7px; border:1px solid var(--cards-border-color); border-radius:999px; color:var(--color-text-600); font-size:10px; font-weight:700; white-space:nowrap; }
+.sd-widget .sd-row-main { min-width:0; }
+.sd-widget .sd-crumb { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--color-text-600); font-size:10px; }
+.sd-widget .sd-line { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-top:2px; font-size:12px; }
+.sd-widget .sd-row-actions { display:flex; gap:5px; opacity:0; pointer-events:none; transition:opacity .1s; }
+.sd-widget .sd-row:hover .sd-row-actions,.sd-widget .sd-row:focus-within .sd-row-actions { opacity:1; pointer-events:auto; }
+.sd-widget .sd-row-actions .sd-btn { padding:4px 7px; font-size:10px; }
+.sd-widget .sd-settings { display:grid; gap:10px; padding:13px; border:1px solid var(--cards-border-color); border-radius:9px; background:var(--cards-bg); }
+.sd-widget .sd-setting { display:grid; grid-template-columns:minmax(150px,1fr) minmax(150px,260px); align-items:center; gap:14px; font-size:12px; }
+.sd-widget .sd-input { width:100%; box-sizing:border-box; border:1px solid var(--cards-border-color); border-radius:6px; padding:6px 8px; background:var(--input-bg-color); color:var(--color-text-400); font:inherit; }
+.sd-widget .sd-input:focus { border-color:var(--button-primary-bg-color); outline:none; }
+.sd-widget .sd-input.sd-invalid { border-color:var(--enum-red-border); color:var(--enum-red-fg); }
+.sd-widget .sd-toggle { justify-self:end; width:18px; height:18px; accent-color:var(--button-primary-bg-color); }
+.sd-widget .sd-footnote { margin-top:2px; color:var(--color-text-600); font-size:10px; }
+.sd-modal.sd-modal-overlay { position:fixed; inset:0; z-index:2147483000; display:grid; place-items:center; padding:20px; background:color-mix(in srgb,var(--color-bg-900) 78%,transparent); }
+.sd-modal .sd-modal-card { width:min(390px,calc(100vw - 40px)); box-sizing:border-box; padding:16px; border:1px solid var(--cards-border-color); border-radius:10px; background:var(--cards-bg); color:var(--color-text-400); font-family:var(--font-family); }
+.sd-modal .sd-modal-title { font-size:14px; font-weight:750; margin-bottom:6px; }
+.sd-modal .sd-modal-note { color:var(--color-text-600); font-size:11px; margin-bottom:10px; }
+.sd-modal .sd-modal-error { min-height:16px; margin-top:5px; color:var(--enum-red-fg); font-size:10px; }
+.sd-modal .sd-modal-actions { display:flex; justify-content:flex-end; gap:7px; margin-top:8px; }
+.sd-modal .sd-input { width:100%; box-sizing:border-box; border:1px solid var(--cards-border-color); border-radius:6px; padding:7px 9px; background:var(--input-bg-color); color:var(--color-text-400); font:inherit; }
+.sd-modal .sd-input:focus { border-color:var(--button-primary-bg-color); outline:none; }
+.sd-modal .sd-btn { border:1px solid var(--cards-border-color); border-radius:7px; padding:6px 11px; background:var(--button-bg-color); color:var(--color-text-400); font:inherit; font-size:12px; cursor:pointer; }
+.sd-modal .sd-btn-primary { border-color:var(--button-primary-bg-color); background:var(--button-primary-bg-color); color:var(--cards-bg); font-weight:650; }
+@media (max-width:620px) { .sd-widget .sd-header{display:block}.sd-widget .sd-badge{margin-top:10px}.sd-widget .sd-row{grid-template-columns:1fr}.sd-widget .sd-setting{grid-template-columns:1fr}.sd-widget .sd-toggle{justify-self:start} }
+`;
+    } catch (error) { this._recordStandaloneError('style', error, null, null); }
+  }
+
+  _registerDashboard() {
+    try {
+      window.__sdPanelMount = panel => {
+        const current = window.__sdInstance;
+        if (current && !current._disposed) current._mountDashboard(panel);
+      };
+      this.ui.registerCustomPanelType('self-destruct', panel => window.__sdPanelMount && window.__sdPanelMount(panel));
+    } catch (error) { this._recordStandaloneError('panel-register', error, null, null); }
+    try {
+      this._statusItem = this.ui.addStatusBarItem({
+        label: 'Self Destruct',
+        icon: 'ti-trash',
+        tooltip: 'Open Self Destruct dashboard',
+        onClick: () => this.openDashboard(),
+      });
+      window.__sdStatusItem = this._statusItem;
+    } catch (error) { this._recordStandaloneError('status-bar', error, null, null); }
+    try {
+      for (const root of document.querySelectorAll('.sd-widget.sd-root')) this._bindDashboardRoot(root, null);
+    } catch (_) {}
+  }
+
+  _mountDashboard(panel) {
+    try { panel.setTitle('Self Destruct'); } catch (_) {}
+    const host = panel && panel.getElement && panel.getElement();
+    if (!host) return;
+    host.innerHTML = '';
+    const root = document.createElement('div');
+    root.className = 'sd-widget sd-root';
+    root.style.background = 'var(--color-bg-900)';
+    host.appendChild(root);
+    this._bindDashboardRoot(root, panel);
+    this._refreshDashboard().catch(() => {});
+  }
+
+  _bindDashboardRoot(root, panel) {
+    if (!root || root.__sdDashboardBound === this) return;
+    const prior = root.__sdDashboardHost;
+    if (prior && prior.click) try { root.removeEventListener('click', prior.click); } catch (_) {}
+    if (prior && prior.change) try { root.removeEventListener('change', prior.change); } catch (_) {}
+    if (prior && prior.input) try { root.removeEventListener('input', prior.input); } catch (_) {}
+    const entry = { root, panel, scanning: false, click: null, change: null, input: null };
+    entry.click = event => this._onDashboardClick(event, entry);
+    entry.change = event => this._onDashboardChange(event);
+    entry.input = event => this._onDashboardInput(event);
+    root.addEventListener('click', entry.click);
+    root.addEventListener('change', entry.change);
+    root.addEventListener('input', entry.input);
+    root.__sdDashboardBound = this;
+    root.__sdDashboardHost = entry;
+    root.style.background = 'var(--color-bg-900)';
+    this._dashboardHosts.add(entry);
+    this._renderDashboard(entry);
+  }
+
+  _escapeHtml(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[char]);
+  }
+
+  _formatTime24(timestamp) {
+    const value = Number(timestamp);
+    if (!Number.isFinite(value)) return 'never';
+    const date = new Date(value);
+    const pad = part => String(part).padStart(2, '0');
+    return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds());
+  }
+
+  _lastSweepReport() {
+    try {
+      const reports = window.__SD_STATS && window.__SD_STATS.reports;
+      return reports && reports.length ? reports[reports.length - 1] : null;
+    } catch (_) { return null; }
+  }
+
+  _pendingVerdicts() {
+    const verdicts = this._dashboardReport && this._dashboardReport.schemaVersion === 1 ? this._dashboardReport.verdicts || [] : [];
+    const statuses = new Set(['wait','delete','defuse','keep','malformed','no-ts']);
+    return verdicts.filter(verdict => verdict && (statuses.has(verdict.status) || verdict.deferred === true)).slice().sort((left, right) => {
+      const actionable = verdict => verdict.status === 'delete' || verdict.status === 'defuse' || verdict.deferred === true ? 0 : 1;
+      const rank = actionable(left) - actionable(right);
+      if (rank) return rank;
+      const leftDeadline = Number.isFinite(left.deadline) ? left.deadline : Number.POSITIVE_INFINITY;
+      const rightDeadline = Number.isFinite(right.deadline) ? right.deadline : Number.POSITIVE_INFINITY;
+      if (leftDeadline !== rightDeadline) return leftDeadline - rightDeadline;
+      return String(left.recordName || '').localeCompare(String(right.recordName || ''));
+    });
+  }
+
+  _verdictLabel(verdict) {
+    if (verdict.deferred) return 'next sweep';
+    if (verdict.status === 'wait') return formatCountdown(verdict.remainingMs);
+    if (verdict.status === 'delete') return 'next sweep';
+    if (verdict.status === 'defuse') return 'defuses (has content)';
+    if (verdict.status === 'keep') return 'kept (#keep)';
+    if (verdict.status === 'malformed') return 'malformed';
+    if (verdict.status === 'no-ts') return 'no timestamp';
+    return verdict.status || 'unknown';
+  }
+
+  _renderDashboard(entry) {
+    if (!entry || !entry.root || !entry.root.isConnected) return;
+    const last = this._lastSweepReport();
+    const report = this._dashboardReport;
+    const verdicts = this._pendingVerdicts();
+    const lastText = last ? this._formatTime24(last.finishedAt || last.startedAt) + ' · ' + String(last.durationMs == null ? 0 : last.durationMs) + ' ms' : 'never';
+    const banners = [];
+    if (report && report.searchCapped) banners.push('Search reached its result cap; some tagged lines may be missing.');
+    if (report && report.capped) banners.push('The line-write budget deferred work to the next sweep.');
+    if (report && report.truncated) banners.push('The sweep was truncated before every candidate was evaluated.');
+    if (report && report.circuitBroken) banners.push('Circuit breaker stopped the sweep: ' + String(report.circuitReason || 'unknown reason') + '.');
+    try { if (window.__SD_STATS && window.__SD_STATS.panelBanner) banners.push(String(window.__SD_STATS.panelBanner.message || window.__SD_STATS.panelBanner)); } catch (_) {}
+    let errorBanner = '';
+    try {
+      const error = window.__SD_LAST_ERROR;
+      if (error) errorBanner = '<div class="sd-banner sd-banner-error">Last error · ' + this._escapeHtml(this._formatTime24(error.ts)) + ' · ' + this._escapeHtml(error.phase) + ': ' + this._escapeHtml(error.message) + '</div>';
+    } catch (_) {}
+    const rows = verdicts.map(verdict => '<div class="sd-row" data-line-guid="' + this._escapeHtml(verdict.lineGuid) + '">' +
+      '<span class="sd-chip">' + this._escapeHtml(this._verdictLabel(verdict)) + '</span>' +
+      '<div class="sd-row-main"><div class="sd-crumb">› ' + this._escapeHtml(verdict.recordName || 'Untitled') + '</div><div class="sd-line" title="' + this._escapeHtml(verdict.text || '') + '">' + this._escapeHtml(verdict.text || '(empty line)') + '</div></div>' +
+      '<div class="sd-row-actions"><button class="sd-btn" type="button" data-sd-action="open">Open</button><button class="sd-btn" type="button" data-sd-action="defuse">Defuse</button><button class="sd-btn sd-btn-danger" type="button" data-sd-action="trash">Trash now</button></div></div>').join('');
+    entry.root.innerHTML = '<div class="sd-shell">' +
+      '<div class="sd-header"><div><div class="sd-title">Self Destruct</div><div class="sd-meta">v' + SD_VERSION + ' · Last sweep ' + this._escapeHtml(lastText) + '</div></div>' +
+      (this._settings.dryRun ? '<span class="sd-badge">DRY RUN ON</span>' : '') + '</div>' +
+      '<div class="sd-actions"><button class="sd-btn sd-btn-primary" type="button" data-sd-action="sweep">Sweep now</button><button class="sd-btn" type="button" data-sd-action="dry">Dry-run sweep</button><button class="sd-btn" type="button" data-sd-action="refresh">Refresh</button></div>' +
+      banners.map(text => '<div class="sd-banner">' + this._escapeHtml(text) + '</div>').join('') + errorBanner +
+      '<section class="sd-section"><div class="sd-section-head"><div class="sd-section-title">Pending</div><div class="sd-muted">' + (entry.scanning ? 'Scanning…' : verdicts.length + ' line' + (verdicts.length === 1 ? '' : 's')) + '</div></div>' +
+      '<div class="sd-list">' + (rows || '<div class="sd-empty">' + (report ? 'No pending self-destruct lines.' : 'Scanning for tagged lines…') + '</div>') + '</div></section>' +
+      '<section class="sd-section"><div class="sd-section-head"><div class="sd-section-title">Settings</div></div><div class="sd-settings">' +
+      '<label class="sd-setting"><span>Default delay</span><input class="sd-input" name="defaultDelay" type="text" value="' + this._escapeHtml(this._settings.defaultDelay) + '" spellcheck="false" aria-label="Default delay"></label>' +
+      '<label class="sd-setting"><span>Line-write budget</span><input class="sd-input" name="lineWriteBudget" type="number" min="1" max="' + SD_HARD_WRITE_CAP + '" value="' + this._escapeHtml(this._settings.lineWriteBudget) + '"></label>' +
+      '<label class="sd-setting"><span>Dry-run by default</span><input class="sd-toggle" name="dryRun" type="checkbox" ' + (this._settings.dryRun ? 'checked' : '') + '></label>' +
+      '<label class="sd-setting"><span>Log enabled</span><input class="sd-toggle" name="logEnabled" type="checkbox" ' + (this._settings.logEnabled ? 'checked' : '') + '></label>' +
+      '<label class="sd-setting"><span>Include deleted content in log</span><input class="sd-toggle" name="contentLog" type="checkbox" ' + (this._settings.contentLog ? 'checked' : '') + '></label>' +
+      '<label class="sd-setting"><span>Log collection GUID</span><input class="sd-input" name="logCollection" type="text" value="' + this._escapeHtml(this._settings.logCollection) + '" spellcheck="false"></label>' +
+      '<div class="sd-footnote">Settings are per-device (localStorage).</div></div></section></div>';
+  }
+
+  _paintDashboards() {
+    for (const entry of Array.from(this._dashboardHosts || [])) {
+      if (!entry.root || !entry.root.isConnected) { this._dashboardHosts.delete(entry); continue; }
+      this._renderDashboard(entry);
+    }
+  }
+
+  async _refreshDashboard() {
+    if (this._dashboardRefreshPromise) return this._dashboardRefreshPromise;
+    for (const entry of this._dashboardHosts) entry.scanning = true;
+    this._paintDashboards();
+    this._dashboardRefreshPromise = (async () => {
+      while (this._running && !this._disposed) await sleep(50);
+      if (this._disposed) return null;
+      const report = await this._requestSweep({ manual: true, dryRun: true, source: 'dry-run' });
+      if (report && report.schemaVersion === 1 && report.dryRun === true) this._dashboardReport = report;
+      return report;
+    })().catch(error => {
+      this._recordStandaloneError('dashboard-refresh', error, null, null);
+      return null;
+    }).finally(() => {
+      for (const entry of this._dashboardHosts) entry.scanning = false;
+      this._dashboardRefreshPromise = null;
+      this._paintDashboards();
+    });
+    return this._dashboardRefreshPromise;
+  }
+
+  _saveSettings(patch) {
+    let stored = {};
+    try { stored = JSON.parse(localStorage.getItem(SD_SETTINGS_KEY) || '{}') || {}; } catch (_) {}
+    const next = Object.assign({}, stored, patch || {});
+    try { localStorage.setItem(SD_SETTINGS_KEY, JSON.stringify(next)); } catch (error) { this._recordStandaloneError('settings-save', error, null, null); return false; }
+    Object.assign(this._settings, patch || {});
+    return true;
+  }
+
+  _onDashboardInput(event) {
+    const input = event.target;
+    if (!input || input.name !== 'defaultDelay') return;
+    const value = String(input.value || '').trim().toLowerCase();
+    const valid = parseDuration(value);
+    const invalid = valid === null || valid === 0;
+    input.classList.toggle('sd-invalid', invalid);
+    input.setAttribute('aria-invalid', invalid ? 'true' : 'false');
+    if (!invalid) this._saveSettings({ defaultDelay: value });
+  }
+
+  _onDashboardChange(event) {
+    const input = event.target;
+    if (!input || !input.name) return;
+    if (input.name === 'lineWriteBudget') {
+      const budget = Math.floor(Number(input.value));
+      if (!Number.isFinite(budget) || budget < 1) { input.classList.add('sd-invalid'); return; }
+      input.classList.remove('sd-invalid');
+      const clamped = Math.min(SD_HARD_WRITE_CAP, budget);
+      input.value = String(clamped);
+      this._saveSettings({ lineWriteBudget: clamped });
+      return;
+    }
+    if (input.name === 'logCollection') {
+      const guid = String(input.value || '').trim();
+      if (guid) this._saveSettings({ logCollection: guid });
+      return;
+    }
+    if (['dryRun','logEnabled','contentLog'].includes(input.name)) {
+      this._saveSettings({ [input.name]: !!input.checked });
+      this._paintDashboards();
+    }
+  }
+
+  async _onDashboardClick(event) {
+    const button = event.target && event.target.closest && event.target.closest('[data-sd-action]');
+    if (!button) return;
+    const action = button.getAttribute('data-sd-action');
+    if (action === 'refresh') { await this._refreshDashboard(); return; }
+    if (action === 'sweep' || action === 'dry') {
+      try {
+        const report = await this._requestSweep({ manual: true, dryRun: action === 'dry' ? true : !!this._settings.dryRun, source: action === 'dry' ? 'dry-run' : 'manual' });
+        if (report && report.dryRun) this._dashboardReport = report;
+      } catch (_) {}
+      this._paintDashboards();
+      if (action === 'sweep' && !this._settings.dryRun) await this._refreshDashboard();
+      return;
+    }
+    const row = button.closest('.sd-row[data-line-guid]');
+    const lineGuid = row && row.getAttribute('data-line-guid');
+    const verdict = this._pendingVerdicts().find(item => item.lineGuid === lineGuid);
+    if (!verdict) return;
+    if (action === 'open') { await this._openVerdict(verdict); return; }
+    if (action === 'defuse') await this.defuseLine(verdict.recordGuid, verdict.lineGuid);
+    if (action === 'trash') await this.trashLineNow(verdict.recordGuid, verdict.lineGuid);
+    this._dashboardReport = null;
+    this._paintDashboards();
+    await this._refreshDashboard();
+  }
+
+  async _openVerdict(verdict) {
+    try {
+      const active = this.ui.getActivePanel();
+      if (!active) { this.openRecordInThisPanel(verdict.recordGuid); return; }
+      const found = await active.navigateTo({ itemGuid: verdict.lineGuid, highlight: true });
+      if (!found) this.openRecordInThisPanel(verdict.recordGuid);
+    } catch (error) { this._recordStandaloneError('open-line', error, verdict.lineGuid, verdict.recordGuid); }
+  }
+
+  openRecordInThisPanel(recordGuid) {
+    if (!recordGuid) return false;
+    const panel = this.ui.getActivePanel();
+    if (!panel) return false;
+    try {
+      panel.navigateTo({ type: 'edit_panel', rootId: recordGuid, workspaceGuid: this.getWorkspaceGuid() });
+      return true;
+    } catch (error) { this._recordStandaloneError('open-record', error, null, recordGuid); return false; }
+  }
+
+  async openDashboard() {
+    const source = this.ui.getActivePanel();
+    try {
+      const created = await this.ui.createPanel({ afterPanel: source });
+      if (created) { created.navigateToCustomType('self-destruct'); return true; }
+      const panels = Array.from(this.ui.getPanels() || []);
+      const panelId = panel => { try { return panel && panel.getId && panel.getId(); } catch (_) { return undefined; } };
+      const sourceId = panelId(source);
+      let reuse = null;
+      const sourceIndex = panels.findIndex(panel => sourceId !== undefined ? panelId(panel) === sourceId : panel === source);
+      if (sourceIndex >= 0 && panels.length > 1) reuse = panels[(sourceIndex + 1) % panels.length];
+      if (!reuse || reuse === source) reuse = panels.find(panel => panel !== source) || null;
+      if (reuse) { reuse.navigateToCustomType('self-destruct'); return true; }
+      const warning = { ts: Date.now(), stage: 'createPanel:null', panelCount: panels.length, message: 'Could not open dashboard: panel cap reached and no adjacent panel was reusable.' };
+      if (window.__SD_STATS) window.__SD_STATS.panelBanner = warning;
+      console.warn('[Self Destruct]', warning.message, warning);
+      this._paintDashboards();
+      return false;
+    } catch (error) {
+      this._recordStandaloneError('open-dashboard', error, null, null);
+      return false;
+    }
+  }
+
   _registerCommands() {
     try {
+      this._commands.push(this.ui.addCommandPaletteCommand({
+        label: 'Self Destruct: Dashboard',
+        icon: 'ti-layout-dashboard',
+        onSelected: () => { this.openDashboard().catch(() => {}); },
+      }));
       this._commands.push(this.ui.addCommandPaletteCommand({
         label: 'Self Destruct: Sweep now',
         icon: 'ti-trash',
@@ -491,7 +860,147 @@ class Plugin extends AppPlugin {
         icon: 'ti-eye',
         onSelected: () => { this._requestSweep({ manual: true, dryRun: true, source: 'dry-run' }).catch(() => {}); },
       }));
+      this._commands.push(this.ui.addCommandPaletteCommand({
+        label: 'Tag current line: #sd',
+        icon: 'ti-tag',
+        onSelected: () => { this._tagCurrentLine('#sd').catch(() => {}); },
+      }));
+      this._commands.push(this.ui.addCommandPaletteCommand({
+        label: 'Tag current line: #sd/empty',
+        icon: 'ti-tag',
+        onSelected: () => { this._tagCurrentLine('#sd/empty').catch(() => {}); },
+      }));
+      this._commands.push(this.ui.addCommandPaletteCommand({
+        label: 'Tag current line with delay…',
+        icon: 'ti-clock',
+        onSelected: () => { this._tagCurrentLineWithDelay().catch(() => {}); },
+      }));
+      this._commands.push(this.ui.addCommandPaletteCommand({
+        label: 'Defuse current line',
+        icon: 'ti-shield-off',
+        onSelected: () => { this._defuseCurrentLine().catch(() => {}); },
+      }));
     } catch (error) { this._recordStandaloneError('commands', error, null, null); }
+  }
+
+  _installCaretStash() {
+    this._caretHandler = () => this._stashCaretGuid();
+    try {
+      document.addEventListener('mouseup', this._caretHandler);
+      document.addEventListener('keyup', this._caretHandler);
+      this._caretPoll = setInterval(() => this._stashCaretGuid(), SD_CARET_POLL_MS);
+      window.__sdCaretHandler = this._caretHandler;
+      window.__sdCaretPoll = this._caretPoll;
+      this._stashCaretGuid();
+    } catch (error) { this._recordStandaloneError('caret-stash', error, null, null); }
+  }
+
+  _stashCaretGuid() {
+    if (this._disposed) return null;
+    const guid = this._currentCaretGuid();
+    if (!guid) return null;
+    this._caretStash = { guid: String(guid), ts: Date.now() };
+    return this._caretStash;
+  }
+
+  _stashedCaretGuid() {
+    this._stashCaretGuid();
+    const stash = this._caretStash;
+    if (!stash || !stash.guid || Date.now() - stash.ts > SD_CARET_STASH_MAX_AGE_MS) return null;
+    return stash.guid;
+  }
+
+  async _caretLine() {
+    const lineGuid = this._stashedCaretGuid();
+    if (!lineGuid) return null;
+    let lineElement = null;
+    try { lineElement = document.querySelector('.listitem[data-guid="' + CSS.escape(lineGuid) + '"]'); } catch (_) {}
+    const recordElement = lineElement && lineElement.closest('.listview-items[data-guid]');
+    const recordGuid = recordElement && recordElement.getAttribute('data-guid');
+    if (!recordGuid) return null;
+    const record = this.data.getRecord(recordGuid);
+    if (!record) return null;
+    const lines = await record.getLineItems(false);
+    const line = (lines || []).find(item => item && item.guid === lineGuid) || null;
+    return line ? { line, lineGuid, record, recordGuid } : null;
+  }
+
+  _toast(title, message) {
+    try { this.ui.addToaster({ title, message, dismissible: true, autoDestroyTime: 2200 }); } catch (_) {}
+  }
+
+  async _tagCurrentLine(tag) {
+    const target = await this._caretLine();
+    if (!target) { this._toast('Self Destruct', 'Click into a line first.'); return false; }
+    const next = [];
+    let replaced = false;
+    for (const segment of target.line.segments || []) {
+      if (segment && segment.type === 'hashtag' && typeof segment.text === 'string' && SD_TAG_RE.test(segment.text)) {
+        if (!replaced) { next.push({ type: 'hashtag', text: tag }); replaced = true; }
+        continue;
+      }
+      next.push(segment);
+    }
+    if (!replaced) next.push({ type: 'text', text: ' ' }, { type: 'hashtag', text: tag });
+    const ok = await target.line.setSegments(next);
+    if (!ok) throw new Error('setSegments returned false');
+    this._dashboardReport = null;
+    this._toast('Self Destruct', 'Tagged current line ' + tag + '.');
+    this._paintDashboards();
+    return true;
+  }
+
+  async _tagCurrentLineWithDelay() {
+    const delay = await this._showDelayModal();
+    if (!delay) return false;
+    return await this._tagCurrentLine('#sd/' + delay);
+  }
+
+  _showDelayModal() {
+    if (typeof this._modalCancel === 'function') this._modalCancel();
+    return new Promise(resolve => {
+      const overlay = document.createElement('div');
+      overlay.className = 'sd-modal sd-modal-overlay';
+      overlay.innerHTML = '<form class="sd-modal-card"><div class="sd-modal-title">Self-destruct delay</div><div class="sd-modal-note">Enter a duration such as 30m, 12h, 3d, or 2w.</div><input class="sd-input" type="text" autocomplete="off" spellcheck="false" aria-label="Self-destruct delay"><div class="sd-modal-error" role="alert"></div><div class="sd-modal-actions"><button class="sd-btn" type="button" data-modal-cancel>Cancel</button><button class="sd-btn sd-btn-primary" type="submit">OK</button></div></form>';
+      const form = overlay.querySelector('form');
+      const input = overlay.querySelector('input');
+      const error = overlay.querySelector('.sd-modal-error');
+      let done = false;
+      const finish = value => {
+        if (done) return;
+        done = true;
+        document.removeEventListener('keydown', onKey, true);
+        overlay.remove();
+        if (window.__sdModalCancel === cancel) delete window.__sdModalCancel;
+        if (this._modalCancel === cancel) this._modalCancel = null;
+        resolve(value);
+      };
+      const cancel = () => finish(null);
+      const onKey = event => { if (event.key === 'Escape') { event.preventDefault(); cancel(); } };
+      form.addEventListener('submit', event => {
+        event.preventDefault();
+        const value = String(input.value || '').trim().toLowerCase();
+        const parsed = parseDuration(value);
+        if (parsed === null || parsed === 0) { error.textContent = 'Use a positive duration: 30m, 12h, 3d, or 2w.'; input.classList.add('sd-invalid'); input.focus(); return; }
+        finish(value);
+      });
+      overlay.querySelector('[data-modal-cancel]').addEventListener('click', cancel);
+      overlay.addEventListener('mousedown', event => { if (event.target === overlay) cancel(); });
+      document.addEventListener('keydown', onKey, true);
+      document.body.appendChild(overlay);
+      this._modalCancel = cancel;
+      window.__sdModalCancel = cancel;
+      setTimeout(() => input.focus(), 0);
+    });
+  }
+
+  async _defuseCurrentLine() {
+    const target = await this._caretLine();
+    if (!target) { this._toast('Self Destruct', 'Click into a line first.'); return false; }
+    const result = await this.defuseLine(target.recordGuid, target.lineGuid);
+    if (result) this._toast('Self Destruct', 'Current line defused.');
+    else this._toast('Self Destruct', 'The line no longer has a self-destruct tag.');
+    return result;
   }
 
   _recordStandaloneError(phase, error, lineGuid, recordGuid) {
@@ -589,6 +1098,70 @@ class Plugin extends AppPlugin {
       const line = thread && thread.closest('.listitem[data-guid]');
       return line ? line.getAttribute('data-guid') : null;
     } catch (_) { return null; }
+  }
+
+  _newActionContext(kind) {
+    const report = newReport({ source: 'manual', dryRun: false });
+    return {
+      report,
+      writeAttempts: 0,
+      actionWrites: 0,
+      attemptedSubtrees: 0,
+      consecutiveDeleteFailures: 0,
+      stopped: false,
+      logCache: { resolved: false, record: null },
+      kind,
+    };
+  }
+
+  async _minimalDiscovery(context) {
+    const templateRecords = new Set();
+    const collections = await this.data.getAllCollections();
+    const templates = (collections || []).find(collection => {
+      try { return collection.getGuid() === SD_TEMPLATES_COLLECTION_GUID; } catch (_) { return false; }
+    });
+    if (templates) {
+      for (const record of await templates.getAllRecords()) if (record && record.guid) templateRecords.add(record.guid);
+    }
+    const logRecord = await this._findLogRecord(false, context);
+    return { lines: [], searchCapped: false, templateRecords, logGuid: logRecord && logRecord.guid || null };
+  }
+
+  async _freshLineByGuid(recordGuid, lineGuid) {
+    if (!recordGuid || !lineGuid) return null;
+    const record = this.data.getRecord(recordGuid);
+    if (!record || this._isTrashed(record)) return null;
+    const lines = await record.getLineItems(false);
+    return (lines || []).find(line => line && line.guid === lineGuid) || null;
+  }
+
+  async defuseLine(recordGuid, lineGuid) {
+    const context = this._newActionContext('manual-defuse');
+    try {
+      const line = await this._freshLineByGuid(recordGuid, lineGuid);
+      if (!line) return false;
+      const discovery = await this._minimalDiscovery(context);
+      const result = await this._defuse(line, discovery, context, { manual: true });
+      return !!(result && result.action && result.action.ok);
+    } catch (error) {
+      this._recordStandaloneError('manual-defuse', error, lineGuid, recordGuid);
+      return false;
+    }
+  }
+
+  async trashLineNow(recordGuid, lineGuid) {
+    const context = this._newActionContext('manual-trash');
+    try {
+      const line = await this._freshLineByGuid(recordGuid, lineGuid);
+      if (!line) return false;
+      const discovery = await this._minimalDiscovery(context);
+      const result = await this._destroyLine(line, discovery, context, { bypassExpiry: true });
+      if (!result.completed) this._toast('Self Destruct', 'Trash now was blocked by a safety check.');
+      return !!result.completed;
+    } catch (error) {
+      this._recordStandaloneError('manual-trash', error, lineGuid, recordGuid);
+      return false;
+    }
   }
 
   _requestSweep(options) {
@@ -701,7 +1274,7 @@ class Plugin extends AppPlugin {
         report.verdicts.push(verdict);
         this._countVerdict(report, verdict);
       }
-      if (!options.dryRun && this._settings.logEnabled && (report.writes > 0 || report.errors.length > 0 || report.circuitBroken)) {
+      if (!options.dryRun && this._settings.logEnabled && !report.skipped && (report.writes > 0 || report.errors.length > 0 || report.circuitBroken)) {
         try { await this._appendLog(report, context); }
         catch (error) { this._reportError(report, 'log', error, null, null); }
       }
@@ -972,8 +1545,17 @@ class Plugin extends AppPlugin {
     }
   }
 
-  async _destroyLine(originalLine, discovery, context) {
-    let verdict = await this._reverify(originalLine, discovery);
+  async _manualDeleteVerdict(state, discovery, options) {
+    const verdict = state && state.verdict;
+    if (options && options.bypassExpiry && state.fresh && verdict && verdict.status === 'wait' && Number.isFinite(verdict.deadline)) {
+      return await this._evaluateLine(state.fresh, discovery, Math.max(Date.now(), verdict.deadline));
+    }
+    return verdict;
+  }
+
+  async _destroyLine(originalLine, discovery, context, options) {
+    let state = await this._reverifyState(originalLine, discovery);
+    let verdict = await this._manualDeleteVerdict(state, discovery, options);
     const deleteVerdict = verdict;
     const deletedGuids = [];
     const content = [];
@@ -987,8 +1569,8 @@ class Plugin extends AppPlugin {
         lastQuietCheckAt = deletedGuids.length;
         if (!await this._waitForEditorQuiet()) break;
       }
-      const state = await this._reverifyState(originalLine, discovery);
-      verdict = state.verdict;
+      state = await this._reverifyState(originalLine, discovery);
+      verdict = await this._manualDeleteVerdict(state, discovery, options);
       if (verdict.status !== 'delete') break;
       const freshRoot = state.fresh;
       if (!freshRoot) break;
@@ -1014,9 +1596,14 @@ class Plugin extends AppPlugin {
     };
   }
 
-  async _defuse(originalLine, discovery, context) {
+  async _defuse(originalLine, discovery, context, options) {
     const state = await this._reverifyState(originalLine, discovery);
-    const verdict = state.verdict;
+    let verdict = state.verdict;
+    const manuallyDefusable = options && options.manual && state.fresh && this._sdTags(state.fresh).length && (
+      ['malformed','no-ts','wait','keep','delete','defuse'].includes(verdict.status) ||
+      (verdict.status === 'skip' && verdict.reason === 'caret')
+    );
+    if (manuallyDefusable && verdict.status !== 'defuse') verdict = this._replaceVerdict(verdict, { status: 'defuse', reason: 'manual-defuse' });
     if (verdict.status !== 'defuse') return { verdict, action: { kind: 'defuse', ok: false, writes: 0, content: [] } };
     const fresh = state.fresh;
     if (!fresh) return { verdict: this._baseSkip(originalLine, 'missing'), action: { kind: 'defuse', ok: false, writes: 0, content: [] } };
