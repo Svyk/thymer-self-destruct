@@ -1,0 +1,9 @@
+{
+  "name": "Self Destruct",
+  "version": "0.1.0",
+  "description": "Dry-run-first self-destruct engine for expiring Thymer line subtrees.",
+  "type": "app",
+  "author": "Svyatoslav Kleshchev",
+  "license": "MIT",
+  "__source_repo": "https://github.com/Svyk/thymer-self-destruct"
+}
