@@ -1,6 +1,6 @@
 'use strict';
 
-const SD_VERSION = '0.1.0';
+const SD_VERSION = '0.1.1';
 const SD_WORKSPACE_GUID = 'WEJ9EZW6ADT58SJC3EQMNETSW6';
 const SD_TEMPLATES_COLLECTION_GUID = '1DEGAQTQARK8MKNAFZ9D1MY16W';
 const SD_SCRATCHPAD_COLLECTION_GUID = '1G8F9FFY4XFXKA2MBGE2FN39B3';
@@ -20,8 +20,11 @@ const SD_LOG_CONTENT_LIMIT = 50;
 const SD_LOG_TEXT_LIMIT = 120;
 const SD_SETTINGS_KEY = 'self-destruct-settings-v1';
 const SD_LOG_GUID_KEY = 'self-destruct-log-guid-v1';
+const SD_RESURRECTED_KEY = 'self-destruct-resurrected-v1';
+const SD_RESURRECTED_MAX_AGE_MS = 30 * 86400000;
+const SD_RESURRECTED_LIMIT = 500;
 const SD_TAG_RE = /^#sd(?:\/|$)/i;
-const SD_KEEP_RE = /^#keep$/i;
+const SD_KEEP_RE = /^#keep(?:\/|$)/i;
 const SD_SUMMARY_RE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}) — /;
 const SD_DEFAULTS = Object.freeze({
   defaultDelay: '3d',
@@ -87,7 +90,7 @@ function mergeSdTags(tags, defaultDelayMs) {
   const parsed = (tags || []).map(tag => typeof tag === 'string' ? parseSdTag(tag) : tag).filter(Boolean);
   const active = parsed.filter(tag => tag.valid);
   const malformed = parsed.filter(tag => !tag.valid);
-  if (!active.length) {
+  if (malformed.length || !active.length) {
     return Object.freeze({
       valid: false,
       inert: malformed.length > 0,
@@ -149,9 +152,8 @@ function classifyLine(line) {
   if (type === 'task' || (typeof line.getTaskStatus === 'function' && line.getTaskStatus() != null)) {
     return Object.freeze({ empty: false, reason: 'task' });
   }
-  if (['image', 'file', 'transclusion'].includes(type)) {
-    return Object.freeze({ empty: false, reason: type });
-  }
+  const emptyEligibleTypes = new Set(['', 'text', 'ulist', 'olist', 'empty', 'br', 'heading', 'quote']);
+  if (!emptyEligibleTypes.has(type)) return Object.freeze({ empty: false, reason: 'type:' + type });
   const segments = line.segments || [];
   const semantic = new Set(['ref', 'datetime', 'linkobj', 'mention', 'image', 'file', 'transclusion']);
   for (const segment of segments) {
@@ -174,6 +176,24 @@ function isSubtreeEmpty(descendants) {
   return (descendants || []).every(line => classifyLine(line).empty);
 }
 
+function hasKeepTag(segments) {
+  return (segments || []).some(segment => segment && segment.type === 'hashtag' && typeof segment.text === 'string' && SD_KEEP_RE.test(segment.text));
+}
+
+function isEmptyDestructTarget(line, descendants) {
+  if ((descendants || []).length) return isSubtreeEmpty(descendants);
+  const segments = (line && line.segments || []).filter(segment => !(
+    segment && segment.type === 'hashtag' && typeof segment.text === 'string' &&
+    (SD_TAG_RE.test(segment.text) || SD_KEEP_RE.test(segment.text))
+  ));
+  const synthetic = {
+    type: line && line.type,
+    segments,
+    getTaskStatus: line && typeof line.getTaskStatus === 'function' ? () => line.getTaskStatus() : undefined,
+  };
+  return classifyLine(synthetic).empty;
+}
+
 function defusedSegments(segments) {
   const output = [];
   let removed = false;
@@ -182,8 +202,8 @@ function defusedSegments(segments) {
       removed = true;
       continue;
     }
-    const segment = Object.assign({}, source || {});
-    if (segment.text && typeof segment.text === 'object') segment.text = Object.assign({}, segment.text);
+    const segment = (source && source.type === 'text') ? Object.assign({}, source) : source;
+    if (!segment) continue;
     if (removed && output.length === 0 && segment.type === 'text' && typeof segment.text === 'string') {
       segment.text = segment.text.replace(/^\s+/, '');
     }
@@ -243,13 +263,13 @@ function formatCountdown(milliseconds) {
  *   basisAt: number|null, deadline: number|null, remainingMs: number|null,
  *   subtreeSize: number, depth: number, empty: boolean|null,
  *   tags: string[], malformedTags: string[], descendants: string[],
- *   deferred: boolean, action: null|{kind:string, ok:boolean, writes:number, deletedLines?:number, content?:string[]}
+ *   deferred: boolean, action: null|{kind:string, ok:boolean, writes:number, partial?:boolean, deletedLines?:number, content?:string[]}
  * }
  *
  * SweepReportShape = {
  *   schemaVersion: 1, sweepId: string, source: 'scheduled'|'manual'|'dry-run',
  *   dryRun: boolean, startedAt: number, finishedAt: number|null, durationMs: number|null,
- *   skipped: boolean, skipReason: string|null, searchCapped: boolean, capped: boolean,
+ *   skipped: boolean, skipReason: string|null, searchCapped: boolean, capped: boolean, truncated: boolean,
  *   circuitBroken: boolean, circuitReason: string|null, candidates: number,
  *   writes: number, writeAttempts: number, failures: number, consecutiveDeleteFailures: number,
  *   deletedLines: number,
@@ -300,6 +320,7 @@ function newReport(options) {
     skipReason: null,
     searchCapped: false,
     capped: false,
+    truncated: false,
     circuitBroken: false,
     circuitReason: null,
     candidates: 0,
@@ -334,7 +355,7 @@ class Plugin extends AppPlugin {
     this._eventIds = [];
     this._commands = [];
     this._quietWaiters = new Set();
-    this._resurrected = new Set();
+    this._resurrected = this._loadResurrected();
     this._settings = this._loadSettings();
     this._lastActivityAt = Date.now();
     this._activityHandler = () => { if (!this._disposed) this._lastActivityAt = Date.now(); };
@@ -388,13 +409,54 @@ class Plugin extends AppPlugin {
     let stored = {};
     try { stored = JSON.parse(localStorage.getItem(SD_SETTINGS_KEY) || '{}') || {}; } catch (_) {}
     const merged = Object.assign({}, SD_DEFAULTS, stored);
-    if (parseDuration(merged.defaultDelay) === null) merged.defaultDelay = SD_DEFAULTS.defaultDelay;
-    merged.lineWriteBudget = Math.max(1, Math.min(SD_HARD_WRITE_CAP, Math.floor(Number(merged.lineWriteBudget) || SD_DEFAULTS.lineWriteBudget)));
+    const defaultDelayMs = parseDuration(merged.defaultDelay);
+    if (defaultDelayMs === null || defaultDelayMs === 0) {
+      console.warn('[Self Destruct] Invalid zero or malformed defaultDelay; using ' + SD_DEFAULTS.defaultDelay);
+      merged.defaultDelay = SD_DEFAULTS.defaultDelay;
+    }
+    const explicitBudget = Object.prototype.hasOwnProperty.call(stored, 'lineWriteBudget');
+    const numericBudget = Number(merged.lineWriteBudget);
+    if (explicitBudget && numericBudget === 0) {
+      console.warn('[Self Destruct] lineWriteBudget 0 is unsafe; clamping to 1');
+      merged.lineWriteBudget = 1;
+    } else {
+      const budget = Number.isFinite(numericBudget) ? numericBudget : SD_DEFAULTS.lineWriteBudget;
+      merged.lineWriteBudget = Math.max(1, Math.min(SD_HARD_WRITE_CAP, Math.floor(budget)));
+    }
     merged.dryRun = stored.dryRun === undefined ? true : stored.dryRun === true;
     merged.logEnabled = stored.logEnabled === undefined ? true : stored.logEnabled === true;
     merged.contentLog = stored.contentLog === undefined ? true : stored.contentLog === true;
     merged.logCollection = String(merged.logCollection || SD_SCRATCHPAD_COLLECTION_GUID);
     return merged;
+  }
+
+  _loadResurrected() {
+    const entries = [];
+    const cutoff = Date.now() - SD_RESURRECTED_MAX_AGE_MS;
+    try {
+      const stored = JSON.parse(localStorage.getItem(SD_RESURRECTED_KEY) || '{}') || {};
+      for (const [guid, value] of Object.entries(stored)) {
+        const at = Number(value);
+        if (guid && Number.isFinite(at) && at >= cutoff) entries.push([guid, at]);
+      }
+    } catch (_) {}
+    entries.sort((a, b) => a[1] - b[1]);
+    return new Map(entries.slice(-SD_RESURRECTED_LIMIT));
+  }
+
+  _markResurrected(guid) {
+    if (!guid) return;
+    const now = Date.now();
+    const cutoff = now - SD_RESURRECTED_MAX_AGE_MS;
+    this._resurrected.set(String(guid), now);
+    const entries = Array.from(this._resurrected.entries())
+      .filter(([, at]) => Number.isFinite(at) && at >= cutoff)
+      .sort((a, b) => a[1] - b[1])
+      .slice(-SD_RESURRECTED_LIMIT);
+    this._resurrected = new Map(entries);
+    const stored = {};
+    for (const [entryGuid, at] of entries) stored[entryGuid] = at;
+    try { localStorage.setItem(SD_RESURRECTED_KEY, JSON.stringify(stored)); } catch (_) {}
   }
 
   _initForensics() {
@@ -411,7 +473,7 @@ class Plugin extends AppPlugin {
   _subscribeUndeletes() {
     try {
       const id = this.events.on('lineitem.undeleted', event => {
-        if (event && event.lineItemGuid) this._resurrected.add(event.lineItemGuid);
+        if (event && event.lineItemGuid) this._markResurrected(event.lineItemGuid);
       }, { collection: '*' });
       if (id) this._eventIds.push(id);
     } catch (error) { this._recordStandaloneError('subscribe', error, null, null); }
@@ -481,9 +543,16 @@ class Plugin extends AppPlugin {
   }
 
   async _waitForEditorQuiet() {
+    const gateStartedAt = Date.now();
+    const recordBlockedGate = () => {
+      const gateBlockedMs = Date.now() - gateStartedAt;
+      if (gateBlockedMs <= 3 * 60000) return;
+      try { if (window.__SD_STATS) window.__SD_STATS.gateBlockedMs = gateBlockedMs; } catch (_) {}
+    };
     let overlayWasOpen = false;
     while (!this._disposed) {
       if (this._nativeOverlayVisible() || this._inputPending()) {
+        recordBlockedGate();
         overlayWasOpen = true;
         this._lastActivityAt = Date.now();
         if (!await this._quietTick(SD_EDITOR_POLL_MS)) return false;
@@ -494,6 +563,7 @@ class Plugin extends AppPlugin {
         this._lastActivityAt = Date.now();
       }
       if (Date.now() - this._lastActivityAt >= SD_EDITOR_QUIET_MS) return true;
+      recordBlockedGate();
       if (!await this._quietTick(SD_EDITOR_POLL_MS)) return false;
     }
     return false;
@@ -524,7 +594,7 @@ class Plugin extends AppPlugin {
   _requestSweep(options) {
     if (this._disposed) return Promise.resolve(null);
     if (this._running) {
-      this._pendingRerun = Object.assign({}, options, { manual: true });
+      this._pendingRerun = Object.assign({}, options);
       return this._sweepPromise;
     }
     this._running = true;
@@ -543,7 +613,15 @@ class Plugin extends AppPlugin {
 
   async _runSweep(options) {
     const report = newReport(options);
-    const context = { report, writeAttempts: 0, actionWrites: 0, consecutiveDeleteFailures: 0, stopped: false };
+    const context = {
+      report,
+      writeAttempts: 0,
+      actionWrites: 0,
+      attemptedSubtrees: 0,
+      consecutiveDeleteFailures: 0,
+      stopped: false,
+      logCache: { resolved: false, record: null },
+    };
     try {
       let workspaceGuid = null;
       try { workspaceGuid = this.getWorkspaceGuid(); } catch (_) {}
@@ -553,16 +631,20 @@ class Plugin extends AppPlugin {
       if (!await this._waitForEditorQuiet()) {
         report.skipped = true; report.skipReason = 'disposed'; return this._finishReport(report, context);
       }
-      if (!options.manual && await this._hasRecentLogSummary()) {
+      if (!options.manual && await this._hasRecentLogSummary(context)) {
         report.skipped = true; report.skipReason = 'multi-client'; return this._finishReport(report, context);
       }
 
-      const discovery = await this._discover(report);
+      const discovery = await this._discover(report, context);
       report.searchCapped = discovery.searchCapped;
       report.candidates = discovery.lines.length;
       const evaluated = [];
       for (let index = 0; index < discovery.lines.length; index++) {
-        if (index && index % SD_BATCH_SIZE === 0 && !await this._waitForEditorQuiet()) break;
+        if (index && index % SD_BATCH_SIZE === 0 && !await this._waitForEditorQuiet()) {
+          report.truncated = true;
+          report.skipReason = 'quiet-gate-abort';
+          break;
+        }
         const line = discovery.lines[index];
         try { evaluated.push({ line, verdict: await this._evaluateLine(line, discovery, Date.now()) }); }
         catch (error) {
@@ -575,7 +657,11 @@ class Plugin extends AppPlugin {
       const subsumed = new Set();
       for (let index = 0; index < evaluated.length; index++) {
         if (context.stopped) break;
-        if (index && index % SD_BATCH_SIZE === 0 && !await this._waitForEditorQuiet()) break;
+        if (index && index % SD_BATCH_SIZE === 0 && !await this._waitForEditorQuiet()) {
+          report.truncated = true;
+          report.skipReason = 'quiet-gate-abort';
+          break;
+        }
         let verdict = evaluated[index].verdict;
         const line = evaluated[index].line;
         if (subsumed.has(verdict.lineGuid)) verdict = this._replaceVerdict(verdict, { status: 'skip', reason: 'subsumed' });
@@ -586,18 +672,22 @@ class Plugin extends AppPlugin {
             if (verdict.status === 'delete' || verdict.status === 'defuse') {
               const planned = verdict.status === 'delete' ? verdict.subtreeSize : 1;
               const remaining = this._settings.lineWriteBudget - context.actionWrites;
-              const oversizedFirst = context.actionWrites === 0;
+              const oversizedFirst = context.attemptedSubtrees === 0;
               if (planned > remaining && !oversizedFirst) {
                 report.capped = true;
                 verdict = this._replaceVerdict(verdict, { status: 'skip', reason: 'budget', deferred: true });
               } else if (options.dryRun) {
+                context.attemptedSubtrees++;
+                context.actionWrites += planned;
                 const action = Object.freeze({ kind: verdict.status, ok: true, writes: 0, deletedLines: verdict.status === 'delete' ? planned : undefined });
                 verdict = this._replaceVerdict(verdict, { action });
               } else if (verdict.status === 'delete') {
+                context.attemptedSubtrees++;
                 const result = await this._destroyLine(line, discovery, context);
                 verdict = this._replaceVerdict(result.verdict || verdict, { action: Object.freeze(result.action) });
                 if (result.completed) for (const guid of result.deletedGuids) subsumed.add(guid);
               } else {
+                context.attemptedSubtrees++;
                 const result = await this._defuse(line, discovery, context);
                 verdict = this._replaceVerdict(result.verdict || verdict, { action: Object.freeze(result.action) });
               }
@@ -611,7 +701,7 @@ class Plugin extends AppPlugin {
         report.verdicts.push(verdict);
         this._countVerdict(report, verdict);
       }
-      if (!options.dryRun && this._settings.logEnabled) {
+      if (!options.dryRun && this._settings.logEnabled && (report.writes > 0 || report.errors.length > 0 || report.circuitBroken)) {
         try { await this._appendLog(report, context); }
         catch (error) { this._reportError(report, 'log', error, null, null); }
       }
@@ -654,6 +744,10 @@ class Plugin extends AppPlugin {
     else if (verdict.status === 'delete') {
       if (report.dryRun) report.counts.wouldDelete++;
       else if (verdict.action && verdict.action.ok) report.counts.delete++;
+      else if (verdict.action && verdict.action.partial) {
+        report.counts.delete++;
+        report.failures++;
+      }
       else report.counts.skip++;
     } else if (verdict.status === 'defuse') {
       if (report.dryRun) report.counts.wouldDefuse++;
@@ -686,8 +780,8 @@ class Plugin extends AppPlugin {
 
   _isTrashed(record) {
     if (!record) return false;
-    if (record.trashed === true || record._trashed === true || record.props && record.props.trashed === true) return true;
-    try { return !!(typeof record.isTrashed === 'function' && record.isTrashed()); } catch (_) { return true; }
+    // PluginRecord exposes no trashed flag in types.d.ts 4789; live verification must confirm whether searchByQuery returns lines from trashed records at all — until then this is best-effort.
+    try { return typeof record.isTrashed === 'function' ? !!record.isTrashed() : false; } catch (_) { return true; }
   }
 
   _baseSkip(line, reason) {
@@ -707,9 +801,14 @@ class Plugin extends AppPlugin {
     try { return record && record.getName ? String(record.getName() || '') : ''; } catch (_) { return ''; }
   }
 
-  async _discover(report) {
+  async _discover(report, context) {
     const result = await this.data.searchByQuery('#sd', SD_SEARCH_LIMIT);
-    if (!result || result.error) throw new Error('searchByQuery: ' + String(result && result.error || 'no result'));
+    if (!result || result.error) {
+      report.skipped = true;
+      report.skipReason = 'search-error';
+      this._reportError(report, 'search', new Error('searchByQuery: ' + String(result && result.error || 'no result')), null, null);
+      return { lines: [], searchCapped: false, templateRecords: new Set(), logGuid: null };
+    }
     const dedup = new Map();
     for (const line of result.lines || []) {
       if (!line || !line.guid) continue;
@@ -724,10 +823,10 @@ class Plugin extends AppPlugin {
     if (templates) {
       for (const record of await templates.getAllRecords()) if (record && record.guid) templateRecords.add(record.guid);
     }
-    const logRecord = await this._findLogRecord(false);
+    const logRecord = await this._findLogRecord(false, context);
     return {
       lines: Array.from(dedup.values()),
-      searchCapped: (result.lines || []).length + (result.records || []).length >= SD_SEARCH_LIMIT,
+      searchCapped: (result.lines || []).length >= SD_SEARCH_LIMIT,
       templateRecords,
       logGuid: logRecord && logRecord.guid || null,
     };
@@ -740,7 +839,7 @@ class Plugin extends AppPlugin {
   }
 
   _hasKeep(line) {
-    return (line && line.segments || []).some(segment => segment && segment.type === 'hashtag' && typeof segment.text === 'string' && SD_KEEP_RE.test(segment.text));
+    return hasKeepTag(line && line.segments || []);
   }
 
   _ageBasis(line, record, now) {
@@ -752,7 +851,7 @@ class Plugin extends AppPlugin {
     for (const [basis, value] of candidates) {
       const at = value instanceof Date ? value.getTime() : Number.NaN;
       if (!Number.isFinite(at)) continue;
-      if (basis === 'line-created' && at - now > 365 * 86400000) return { basis: null, at: null, reason: 'future-created' };
+      if (at - now > 365 * 86400000) return { basis: null, at: null, reason: 'future-created' };
       return { basis, at, reason: null };
     }
     return { basis: null, at: null, reason: 'no-ts' };
@@ -800,10 +899,10 @@ class Plugin extends AppPlugin {
       depth: ancestors.length,
       descendants: Object.freeze(descendants.map(item => item.guid)),
     };
-    if (now < deadline) return frozenVerdict(Object.assign(common, treeFields, { status: 'wait', reason: 'not-expired' }));
     if ([line].concat(ancestors, descendants).some(item => this._hasKeep(item))) {
       return frozenVerdict(Object.assign(common, treeFields, { status: 'keep', reason: 'keep-veto' }));
     }
+    if (now < deadline) return frozenVerdict(Object.assign(common, treeFields, { status: 'wait', reason: 'not-expired' }));
     const caretGuid = this._currentCaretGuid();
     if (caretGuid && [line].concat(descendants).some(item => item.guid === caretGuid)) {
       return frozenVerdict(Object.assign(common, treeFields, { status: 'skip', reason: 'caret' }));
@@ -812,7 +911,7 @@ class Plugin extends AppPlugin {
       return frozenVerdict(Object.assign(common, treeFields, { status: 'defuse', reason: 'resurrected', empty: null }));
     }
     if (merged.empty) {
-      const empty = isSubtreeEmpty(descendants);
+      const empty = isEmptyDestructTarget(line, descendants);
       return frozenVerdict(Object.assign(common, treeFields, { status: empty ? 'delete' : 'defuse', reason: empty ? 'empty' : 'content', empty }));
     }
     return frozenVerdict(Object.assign(common, treeFields, { status: 'delete', reason: 'expired', empty: null }));
@@ -875,13 +974,19 @@ class Plugin extends AppPlugin {
 
   async _destroyLine(originalLine, discovery, context) {
     let verdict = await this._reverify(originalLine, discovery);
+    const deleteVerdict = verdict;
     const deletedGuids = [];
     const content = [];
     if (verdict.status !== 'delete') return { completed: false, deletedGuids, verdict, action: { kind: 'delete', ok: false, writes: 0, deletedLines: 0, content } };
     const recordGuid = verdict.recordGuid;
     const targets = verdict.descendants.slice().reverse().concat(verdict.lineGuid);
+    let lastQuietCheckAt = 0;
     for (const targetGuid of targets) {
       if (context.stopped) break;
+      if (deletedGuids.length > 0 && deletedGuids.length % SD_BATCH_SIZE === 0 && deletedGuids.length !== lastQuietCheckAt) {
+        lastQuietCheckAt = deletedGuids.length;
+        if (!await this._waitForEditorQuiet()) break;
+      }
       const state = await this._reverifyState(originalLine, discovery);
       verdict = state.verdict;
       if (verdict.status !== 'delete') break;
@@ -890,18 +995,22 @@ class Plugin extends AppPlugin {
       const tree = await freshRoot.getTreeContext();
       const current = [freshRoot].concat(tree.descendants || []).find(item => item.guid === targetGuid);
       if (!current) continue;
-      content.push(lineText(current).slice(0, SD_LOG_TEXT_LIMIT));
+      const owner = typeof current.getRecord === 'function' ? current.getRecord() : current.record;
+      if (!owner || owner.guid !== recordGuid) continue;
+      const snapshot = lineText(current).slice(0, SD_LOG_TEXT_LIMIT);
       const ok = await this._attemptWrite(context, 'delete', () => current.delete(), current.guid, recordGuid, true, true);
       if (!ok) break;
+      content.push(snapshot);
       deletedGuids.push(current.guid);
       context.report.deletedLines++;
     }
     const completed = deletedGuids.includes(originalLine.guid);
+    const partial = !completed && deletedGuids.length > 0;
     return {
       completed,
       deletedGuids,
-      verdict,
-      action: { kind: 'delete', ok: completed, writes: deletedGuids.length, deletedLines: deletedGuids.length, content },
+      verdict: partial ? deleteVerdict : verdict,
+      action: { kind: 'delete', ok: completed, partial, writes: deletedGuids.length, deletedLines: deletedGuids.length, content },
     };
   }
 
@@ -916,18 +1025,30 @@ class Plugin extends AppPlugin {
     return { verdict, action: { kind: 'defuse', ok, writes: ok ? 1 : 0, content: [before] } };
   }
 
-  async _findLogRecord(create) {
-    let cachedGuid = null;
-    try { cachedGuid = localStorage.getItem(SD_LOG_GUID_KEY); } catch (_) {}
-    if (cachedGuid) {
-      const cached = this.data.getRecord(cachedGuid);
-      if (cached && !this._isTrashed(cached) && this._recordName(cached) === SD_LOG_NAME) return cached;
-    }
-    for (const record of this.data.getAllRecords() || []) {
-      if (record && !this._isTrashed(record) && this._recordName(record) === SD_LOG_NAME) {
-        try { localStorage.setItem(SD_LOG_GUID_KEY, record.guid); } catch (_) {}
-        return record;
+  async _findLogRecord(create, context) {
+    const sweepCache = context && context.logCache;
+    const remember = record => {
+      if (sweepCache) {
+        sweepCache.resolved = true;
+        sweepCache.record = record || null;
       }
+      return record || null;
+    };
+    if (sweepCache && sweepCache.record) return sweepCache.record;
+    if (!sweepCache || !sweepCache.resolved) {
+      let cachedGuid = null;
+      try { cachedGuid = localStorage.getItem(SD_LOG_GUID_KEY); } catch (_) {}
+      if (cachedGuid) {
+        const cached = this.data.getRecord(cachedGuid);
+        if (cached && !this._isTrashed(cached) && this._recordName(cached) === SD_LOG_NAME) return remember(cached);
+      }
+      for (const record of this.data.getAllRecords() || []) {
+        if (record && !this._isTrashed(record) && this._recordName(record) === SD_LOG_NAME) {
+          try { localStorage.setItem(SD_LOG_GUID_KEY, record.guid); } catch (_) {}
+          return remember(record);
+        }
+      }
+      remember(null);
     }
     if (!create) return null;
     const collections = await this.data.getAllCollections();
@@ -941,7 +1062,7 @@ class Plugin extends AppPlugin {
       const record = this.data.getRecord(guid);
       if (record) {
         try { localStorage.setItem(SD_LOG_GUID_KEY, guid); } catch (_) {}
-        return record;
+        return remember(record);
       }
       await sleep(100);
     }
@@ -957,21 +1078,21 @@ class Plugin extends AppPlugin {
     const match = lineText(line).match(SD_SUMMARY_RE);
     if (!match) return null;
     const parsed = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5])).getTime();
-    if (Number.isFinite(parsed)) return parsed;
-    try { const created = line.getCreatedAt(); return created instanceof Date ? created.getTime() : null; } catch (_) { return null; }
+    return Number.isFinite(parsed) ? parsed : null;
   }
 
-  async _hasRecentLogSummary() {
-    const log = await this._findLogRecord(false);
+  async _hasRecentLogSummary(context) {
+    const log = await this._findLogRecord(false, context);
     if (!log) return false;
     const lines = await log.getLineItems(false);
+    const isTop = line => !line.parent_guid || line.parent_guid === log.guid;
     let latest = null;
     for (const line of lines || []) {
-      if (line.parent_guid) continue;
+      if (!isTop(line)) continue;
       const at = this._summaryTimestamp(line);
       if (at !== null) latest = latest === null ? at : Math.max(latest, at);
     }
-    return latest !== null && Date.now() - latest >= 0 && Date.now() - latest < SD_MULTI_CLIENT_MS;
+    return latest !== null && Date.now() - latest < SD_MULTI_CLIENT_MS;
   }
 
   async _createLogLine(record, parent, after, segments, context) {
@@ -985,58 +1106,76 @@ class Plugin extends AppPlugin {
 
   _logDetailSegments(prefix, verdict) {
     const segments = [{ type: 'text', text: prefix + ' ' }];
-    if (verdict.recordGuid) segments.push({ type: 'ref', text: verdict.recordGuid });
+    if (verdict.recordGuid) segments.push({ type: 'ref', text: { guid: verdict.recordGuid } });
     const suffix = (verdict.text || '').slice(0, SD_LOG_TEXT_LIMIT);
     if (suffix) segments.push({ type: 'text', text: ' — ' + suffix });
     return segments;
   }
 
   async _appendLog(report, context) {
-    if (context.stopped) return;
-    const log = await this._findLogRecord(true);
-    const lines = await log.getLineItems(false);
-    const top = (lines || []).filter(line => !line.parent_guid);
-    const after = top.length ? top[top.length - 1] : null;
-    const warn = report.capped || report.searchCapped || report.circuitBroken ? ' ⚠' : '';
-    const capped = report.capped ? ' capped' : '';
-    const summaryText = this._logTimestamp(new Date()) + ' — ' + report.counts.delete + ' deleted (' + report.deletedLines + ' lines), ' + report.counts.defuse + ' defused, ' + report.counts.keep + ' kept' + warn + capped;
-    const summary = await this._createLogLine(log, null, after, [{ type: 'text', text: summaryText }], context);
-    if (!summary) return;
-    let detailAfter = null;
-    let contentCount = 0;
-    for (const verdict of report.verdicts) {
-      let prefix = null;
-      if (verdict.status === 'delete' && verdict.action && verdict.action.ok) prefix = '[del]';
-      else if (verdict.status === 'defuse' && verdict.action && verdict.action.ok) prefix = '[fuse]';
-      if (!prefix) continue;
-      const detail = await this._createLogLine(log, summary, detailAfter, this._logDetailSegments(prefix, verdict), context);
-      if (!detail) break;
-      detailAfter = detail;
-      if (this._settings.contentLog && prefix === '[del]') {
-        let contentAfter = null;
-        for (const text of verdict.action.content || []) {
-          if (contentCount >= SD_LOG_CONTENT_LIMIT) break;
-          const child = await this._createLogLine(log, detail, contentAfter, [{ type: 'text', text: String(text || '').slice(0, SD_LOG_TEXT_LIMIT) }], context);
-          if (!child) break;
-          contentAfter = child;
-          contentCount++;
+    const logContext = {
+      report,
+      writeAttempts: 0,
+      actionWrites: 0,
+      attemptedSubtrees: 0,
+      consecutiveDeleteFailures: 0,
+      stopped: false,
+      logCache: context.logCache || { resolved: false, record: null },
+    };
+    try {
+      const log = await this._findLogRecord(true, logContext);
+      const lines = await log.getLineItems(false);
+      const isTop = line => !line.parent_guid || line.parent_guid === log.guid;
+      const top = (lines || []).filter(isTop);
+      const after = top.length ? top[top.length - 1] : null;
+      const warn = report.capped || report.searchCapped || report.circuitBroken ? ' ⚠' : '';
+      const capped = report.capped ? ' capped' : '';
+      const summaryText = this._logTimestamp(new Date()) + ' — ' + report.counts.delete + ' deleted (' + report.deletedLines + ' lines), ' + report.counts.defuse + ' defused, ' + report.counts.keep + ' kept' + warn + capped;
+      const summary = await this._createLogLine(log, null, after, [{ type: 'text', text: summaryText }], logContext);
+      if (!summary) return;
+      let detailAfter = null;
+      let contentCount = 0;
+      if (report.circuitBroken) {
+        detailAfter = await this._createLogLine(log, summary, null, [{ type: 'text', text: '[err] breaker ' + String(report.circuitReason || 'unknown') }], logContext);
+      }
+      for (const verdict of report.verdicts) {
+        let prefix = null;
+        if (verdict.status === 'delete' && verdict.action && verdict.action.ok) prefix = '[del]';
+        else if (verdict.status === 'delete' && verdict.action && verdict.action.deletedLines > 0) prefix = '[del*]';
+        else if (verdict.status === 'defuse' && verdict.action && verdict.action.ok) prefix = '[fuse]';
+        if (!prefix) continue;
+        const detail = await this._createLogLine(log, summary, detailAfter, this._logDetailSegments(prefix, verdict), logContext);
+        if (!detail) break;
+        detailAfter = detail;
+        if (this._settings.contentLog && (prefix === '[del]' || prefix === '[del*]')) {
+          let contentAfter = null;
+          for (const text of verdict.action.content || []) {
+            if (contentCount >= SD_LOG_CONTENT_LIMIT) break;
+            const child = await this._createLogLine(log, detail, contentAfter, [{ type: 'text', text: String(text || '').slice(0, SD_LOG_TEXT_LIMIT) }], logContext);
+            if (!child) break;
+            contentAfter = child;
+            contentCount++;
+          }
         }
       }
+      for (const error of report.errors.slice(0, 20)) {
+        const segments = [{ type: 'text', text: '[err] ' + error.phase + ' ' }];
+        if (error.recordGuid) segments.push({ type: 'ref', text: { guid: error.recordGuid } });
+        segments.push({ type: 'text', text: ' — ' + error.message.slice(0, SD_LOG_TEXT_LIMIT) });
+        const detail = await this._createLogLine(log, summary, detailAfter, segments, logContext);
+        if (!detail) break;
+        detailAfter = detail;
+      }
+      await this._pruneLog(log, logContext);
+    } finally {
+      context.writeAttempts += logContext.writeAttempts;
     }
-    for (const error of report.errors.slice(0, 20)) {
-      const segments = [{ type: 'text', text: '[err] ' + error.phase + ' ' }];
-      if (error.recordGuid) segments.push({ type: 'ref', text: error.recordGuid });
-      segments.push({ type: 'text', text: ' — ' + error.message.slice(0, SD_LOG_TEXT_LIMIT) });
-      const detail = await this._createLogLine(log, summary, detailAfter, segments, context);
-      if (!detail) break;
-      detailAfter = detail;
-    }
-    await this._pruneLog(log, context);
   }
 
   async _pruneLog(log, context) {
     const lines = await log.getLineItems(false);
-    const summaries = (lines || []).filter(line => !line.parent_guid && SD_SUMMARY_RE.test(lineText(line)));
+    const isTop = line => !line.parent_guid || line.parent_guid === log.guid;
+    const summaries = (lines || []).filter(line => isTop(line) && SD_SUMMARY_RE.test(lineText(line)));
     if (summaries.length <= SD_LOG_SWEEP_LIMIT) return;
     const remove = summaries.slice(0, summaries.length - SD_LOG_SWEEP_LIMIT);
     for (const old of remove) {
@@ -1045,10 +1184,10 @@ class Plugin extends AppPlugin {
       const fresh = (freshLines || []).find(line => line.guid === old.guid);
       if (!fresh) continue;
       const tree = await fresh.getTreeContext();
+      const currentByGuid = new Map((freshLines || []).map(line => [line.guid, line]));
       for (const target of (tree.descendants || []).slice().reverse().concat(fresh)) {
         if (context.stopped) break;
-        const currentLines = await log.getLineItems(false);
-        const current = (currentLines || []).find(line => line.guid === target.guid);
+        const current = currentByGuid.get(target.guid);
         if (!current) continue;
         const ok = await this._attemptWrite(context, 'log-prune', () => current.delete(), current.guid, log.guid, true, false);
         if (!ok) break;
@@ -1064,6 +1203,8 @@ if (typeof module !== 'undefined' && module.exports) {
     computeDeadline,
     classifyLine,
     isSubtreeEmpty,
+    hasKeepTag,
+    isEmptyDestructTarget,
     defusedSegments,
     formatCountdown,
     parseDuration,

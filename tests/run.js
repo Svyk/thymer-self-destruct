@@ -10,6 +10,8 @@ const {
   computeDeadline,
   classifyLine,
   isSubtreeEmpty,
+  hasKeepTag,
+  isEmptyDestructTarget,
   defusedSegments,
   formatCountdown,
   parseDuration,
@@ -46,13 +48,14 @@ test('parseSdTag parses duration', () => assert.strictEqual(parseSdTag('#sd/7d')
 test('parseSdTag parses order-free empty duration', () => { const tag = parseSdTag('#SD/3d/EMPTY'); assert.strictEqual(tag.empty, true); assert.strictEqual(tag.delayMs, 259200000); });
 test('parseSdTag parses now', () => { const tag = parseSdTag('#sd/now'); assert.strictEqual(tag.now, true); assert.strictEqual(tag.delayMs, 0); });
 test('parseSdTag makes malformed tag inert', () => { const tag = parseSdTag('#sd/3x'); assert.strictEqual(tag.valid, false); assert.strictEqual(tag.inert, true); });
+test('parseSdTag makes trailing slash malformed and inert', () => { const tag = parseSdTag('#sd/'); assert.strictEqual(tag.valid, false); assert.strictEqual(tag.inert, true); });
 test('parseSdTag rejects duplicate timers', () => assert.strictEqual(parseSdTag('#sd/1d/2d').valid, false));
 test('parseSdTag ignores fuzzy sdk', () => assert.strictEqual(parseSdTag('#sdk'), null));
 
 test('mergeSdTags applies default delay', () => assert.strictEqual(mergeSdTags(['#sd'], parseDuration('3d')).delayMs, parseDuration('3d')));
 test('mergeSdTags takes latest deadline and ORs empty', () => { const merged = mergeSdTags(['#sd/now', '#sd/empty/7d'], parseDuration('3d')); assert.strictEqual(merged.delayMs, parseDuration('7d')); assert.strictEqual(merged.empty, true); });
 test('mergeSdTags leaves malformed-only set inert', () => { const merged = mergeSdTags(['#sd/banana'], parseDuration('3d')); assert.strictEqual(merged.valid, false); assert.strictEqual(merged.inert, true); });
-test('mergeSdTags keeps valid timer alongside malformed tag', () => { const merged = mergeSdTags(['#sd/banana', '#sd/2d'], parseDuration('3d')); assert.strictEqual(merged.valid, true); assert.strictEqual(merged.malformedTags.length, 1); });
+test('mergeSdTags makes whole line inert when any tag is malformed', () => { const merged = mergeSdTags(['#sd/empty/3x', '#sd/2d'], parseDuration('3d')); assert.strictEqual(merged.valid, false); assert.strictEqual(merged.inert, true); assert.strictEqual(merged.malformedTags.length, 1); });
 
 test('computeDeadline accepts Date basis', () => assert.strictEqual(computeDeadline(new Date(1000), 500), 1500));
 test('computeDeadline rejects missing basis', () => assert.strictEqual(computeDeadline(null, 500), null));
@@ -75,10 +78,20 @@ test('classifyLine treats ordinary text as content', () => assert.strictEqual(cl
 test('classifyLine treats any task status as content', () => assert.strictEqual(classifyLine(line([text('')], 'task', 'done')).reason, 'task'));
 test('classifyLine treats semantic segments as content', () => { for (const type of ['ref','datetime','linkobj','mention']) assert.strictEqual(classifyLine(line([{ type, text: '' }])).empty, false); });
 test('classifyLine treats media and transclusion line types as content', () => { for (const type of ['image','file','transclusion']) assert.strictEqual(classifyLine(line([], type)).empty, false); });
+test('classifyLine treats non-empty-eligible SDK line types as content', () => { for (const type of ['media','query','ref','table']) assert.strictEqual(classifyLine(line([], type)).empty, false); });
 
 test('isSubtreeEmpty accepts blank hashtag and bare attributes', () => assert.strictEqual(isSubtreeEmpty([line([text('')]), line([hashtag('#x')]), line([text('Focus::')])]), true));
 test('isSubtreeEmpty rejects one content descendant', () => assert.strictEqual(isSubtreeEmpty([line([text('')]), line([text('answer')])]), false));
 test('isSubtreeEmpty accepts no descendants', () => assert.strictEqual(isSubtreeEmpty([]), true));
+
+test('hasKeepTag vetoes keep roots and namespaces case-insensitively', () => {
+  assert.strictEqual(hasKeepTag([hashtag('#keep')]), true);
+  assert.strictEqual(hasKeepTag([hashtag('#KEEP/x')]), true);
+});
+test('hasKeepTag does not match keeper', () => assert.strictEqual(hasKeepTag([hashtag('#keeper')]), false));
+
+test('empty destruct leaf treats bare attribute as delete-eligible', () => assert.strictEqual(isEmptyDestructTarget(line([text('Notes:: '), hashtag('#sd/empty')]), []), true));
+test('empty destruct leaf treats filled attribute as content', () => assert.strictEqual(isEmptyDestructTarget(line([text('Notes:: filled '), hashtag('#sd/empty')]), []), false));
 
 test('defusedSegments strips all strict sd tags', () => assert.deepStrictEqual(defusedSegments([hashtag('#sd'), text(' '), hashtag('#SD/7d')]), [{ type: 'text', text: '' }]));
 test('defusedSegments preserves fuzzy sdk', () => assert.deepStrictEqual(defusedSegments([hashtag('#sdk')]), [hashtag('#sdk')]));
@@ -87,8 +100,10 @@ test('defusedSegments removes leading tag whitespace', () => assert.deepStrictEq
 test('defusedSegments keeps a tight seam tight', () => assert.deepStrictEqual(defusedSegments([text('Alpha'), hashtag('#sd'), text('beta')]), [text('Alphabeta')]));
 test('defusedSegments rtrims trailing text', () => assert.deepStrictEqual(defusedSegments([text('Alpha '), hashtag('#sd')]), [text('Alpha')]));
 test('defusedSegments does not mutate source segments', () => { const source = [text('Alpha '), hashtag('#sd')]; defusedSegments(source); assert.strictEqual(source[0].text, 'Alpha '); });
+test('defusedSegments preserves datetime object identity', () => { const dateTime = { kind: 'date', value: '2026-07-31' }; const output = defusedSegments([{ type: 'datetime', text: dateTime }, hashtag('#sd')]); assert.strictEqual(output[0].text, dateTime); });
 
 test('formatCountdown reports due', () => assert.strictEqual(formatCountdown(0), 'due'));
+test('formatCountdown reports negative values as due', () => assert.strictEqual(formatCountdown(-5), 'due'));
 test('formatCountdown reports sub-minute', () => assert.strictEqual(formatCountdown(59999), '<1m'));
 test('formatCountdown reports two largest units', () => assert.strictEqual(formatCountdown(parseDuration('1w') + parseDuration('2d') + parseDuration('3h')), '1w 2d'));
 test('formatCountdown reports hours and minutes', () => assert.strictEqual(formatCountdown(parseDuration('2h') + parseDuration('5m')), '2h 5m'));
