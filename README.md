@@ -1,6 +1,6 @@
 # Thymer Self Destruct
 
-Self Destruct is a Thymer app plugin that expires tagged lines and their subtrees. Version 0.1.0 is the engine-only release: it includes discovery, safety verdicts, dry-run/acting sweeps, defusing, logging, and forensic globals. It intentionally does not include the dashboard, caret-tagging actions, status item, or settings panel planned for GOAL-2.
+Self Destruct is a Thymer app plugin that expires tagged lines and their subtrees. Version 0.3.0 includes the safety engine, dashboard, tagging and manual actions, logging, forensic globals, and flash-free document tag hiding.
 
 ## Tag grammar
 
@@ -17,9 +17,11 @@ Hashtag segment text includes the leading `#`. Tokens after `#sd` are slash-sepa
 
 Durations use `\d+(m|h|d|w)`. An unknown or malformed token makes that tag inert; it never falls back to the default timer. With multiple valid `#sd` tags on one line, `empty` is ORed and the latest deadline wins. Defusing removes every strict `#sd` hashtag while leaving all other content intact.
 
+For `#sd/empty`, plain `dc:`, `dc.js:`, and `dc.js(...)` marker lines count as scaffold rather than content. Native query/transclusion line types remain content.
+
 ## Settings
 
-GOAL-1 has no settings UI. Settings are stored per device/origin in the `self-destruct-settings-v1` localStorage key:
+Settings are available in the Self Destruct dashboard and are stored per device/origin in the `self-destruct-settings-v1` localStorage key:
 
 ```json
 {
@@ -28,16 +30,18 @@ GOAL-1 has no settings UI. Settings are stored per device/origin in the `self-de
   "dryRun": true,
   "logEnabled": true,
   "contentLog": true,
+  "hideTags": true,
   "logCollection": "1G8F9FFY4XFXKA2MBGE2FN39B3"
 }
 ```
 
-`dryRun` defaults to `true`. `defaultDelay` must pass the same duration grammar. `lineWriteBudget` is clamped to 1–300. The default log collection is Scratchpad. Settings are read on plugin load; reload after changing the localStorage value.
+`dryRun` and `hideTags` default to `true`. `defaultDelay` must pass the same duration grammar. `lineWriteBudget` is clamped to 1–300. The default log collection is Scratchpad. Tag hiding applies live: strict `#sd` chips are hidden in documents, but remain visible in Templates records, on the caret line, and on hovered lines. `#keep` is never hidden.
 
-Two palette commands are registered:
+The dashboard and palette expose sweep, tagging, defuse, and tag-visibility actions, including:
 
 - **Self Destruct: Sweep now** respects the saved `dryRun` setting.
 - **Self Destruct: Dry-run sweep** always performs a zero-write preview.
+- **Self Destruct: Toggle tag hiding** applies the hide-tags setting immediately.
 
 The same operations are available as `window.__SD_SWEEP()` and `window.__SD_DRY()`.
 
@@ -47,6 +51,7 @@ The same operations are available as `window.__SD_SWEEP()` and `window.__SD_DRY(
 - Templates, the Self-Destruct Log, and trashed records are exempt. Unknown age bases and creation timestamps more than one year in the future are never deleted.
 - Lines with children are deleted bottom-up. Every destructive write re-reads the live record and re-runs tag, expiry, `#keep`, subtree-emptiness, and caret checks.
 - The active caret subtree is skipped. A line seen in a `lineitem.undeleted` event is defused instead of re-deleted.
+- Explicit manual **Trash now** and **Defuse** gestures bypass the caret guard by design; all other safety checks and live re-verification remain active.
 - The default line-write budget is 100 and admits subtrees whole. One oversized subtree may run only when it is the first action. A hard breaker stops at 300 write attempts or 10 consecutive delete failures.
 - Sweeps wait for two seconds of editor quiet before discovery and between batches of ten. Native overlays hard-block the gate. Scheduled acting clients defer when the log shows another sweep within 15 minutes.
 - Acting sweeps append explicit line items to `Self-Destruct Log`, retain 50 sweep blocks, and optionally capture at most 50 deleted lines of 120 characters each. Dry runs write nothing, including no log.

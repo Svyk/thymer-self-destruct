@@ -17,6 +17,7 @@ const {
   parseDuration,
   parseAttrLine,
   lineText,
+  matchesSdTagText,
 } = require('../plugin.js');
 
 let passed = 0;
@@ -52,6 +53,13 @@ test('parseSdTag makes trailing slash malformed and inert', () => { const tag = 
 test('parseSdTag rejects duplicate timers', () => assert.strictEqual(parseSdTag('#sd/1d/2d').valid, false));
 test('parseSdTag ignores fuzzy sdk', () => assert.strictEqual(parseSdTag('#sdk'), null));
 
+test('tag stamper matcher accepts the #sd family case-insensitively', () => {
+  for (const value of ['#sd', '#SD/7d', '  #sd/empty/1d  ']) assert.strictEqual(matchesSdTagText(value), true);
+});
+test('tag stamper matcher rejects non-sd and embedded text', () => {
+  for (const value of ['#keep', '#sdk', 'prefix #sd', '#sdx/1d']) assert.strictEqual(matchesSdTagText(value), false);
+});
+
 test('mergeSdTags applies default delay', () => assert.strictEqual(mergeSdTags(['#sd'], parseDuration('3d')).delayMs, parseDuration('3d')));
 test('mergeSdTags takes latest deadline and ORs empty', () => { const merged = mergeSdTags(['#sd/now', '#sd/empty/7d'], parseDuration('3d')); assert.strictEqual(merged.delayMs, parseDuration('7d')); assert.strictEqual(merged.empty, true); });
 test('mergeSdTags leaves malformed-only set inert', () => { const merged = mergeSdTags(['#sd/banana'], parseDuration('3d')); assert.strictEqual(merged.valid, false); assert.strictEqual(merged.inert, true); });
@@ -75,6 +83,12 @@ test('classifyLine treats hashtag-only as empty', () => assert.strictEqual(class
 test('classifyLine treats bare attribute as empty', () => assert.strictEqual(classifyLine(line([text('Focus::')])).empty, true));
 test('classifyLine treats filled attribute as content', () => assert.strictEqual(classifyLine(line([text('Focus:: ship')])).empty, false));
 test('classifyLine treats ordinary text as content', () => assert.strictEqual(classifyLine(line([text('ship it')])).empty, false));
+test('classifyLine treats dc colon markers as scaffold', () => assert.deepStrictEqual(classifyLine(line([text('dc: @"Rich Tasks" and ...')])), { empty: true, reason: 'dc-marker' }));
+test('classifyLine treats dc.js call markers as scaffold', () => assert.deepStrictEqual(classifyLine(line([text('dc.js(q): body')])), { empty: true, reason: 'dc-marker' }));
+test('classifyLine reconstructs dc markers across native ref segments', () => assert.strictEqual(classifyLine(line([text('dc: '), { type: 'ref', text: { guid: 'g', title: 'Rich Tasks' } }])).reason, 'dc-marker'));
+test('classifyLine does not treat dcx as scaffold', () => assert.strictEqual(classifyLine(line([text('dcx: nope')])).empty, false));
+test('classifyLine keeps unrelated plain text as content', () => assert.strictEqual(classifyLine(line([text('documentation: body')])).empty, false));
+test('classifyLine keeps native query line types as content', () => assert.strictEqual(classifyLine(line([text('dc: query')], 'query')).empty, false));
 test('classifyLine treats any task status as content', () => assert.strictEqual(classifyLine(line([text('')], 'task', 'done')).reason, 'task'));
 test('classifyLine treats semantic segments as content', () => { for (const type of ['ref','datetime','linkobj','mention']) assert.strictEqual(classifyLine(line([{ type, text: '' }])).empty, false); });
 test('classifyLine treats media and transclusion line types as content', () => { for (const type of ['image','file','transclusion']) assert.strictEqual(classifyLine(line([], type)).empty, false); });

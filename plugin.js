@@ -1,6 +1,6 @@
 'use strict';
 
-const SD_VERSION = '0.2.2';
+const SD_VERSION = '0.3.0';
 const SD_WORKSPACE_GUID = 'WEJ9EZW6ADT58SJC3EQMNETSW6';
 const SD_TEMPLATES_COLLECTION_GUID = '1DEGAQTQARK8MKNAFZ9D1MY16W';
 const SD_SCRATCHPAD_COLLECTION_GUID = '1G8F9FFY4XFXKA2MBGE2FN39B3';
@@ -28,6 +28,7 @@ const SD_CARET_POLL_MS = 400;
 const SD_CARET_STASH_MAX_AGE_MS = 3 * 60 * 1000;
 const SD_TAG_RE = /^#sd(?:\/|$)/i;
 const SD_KEEP_RE = /^#keep(?:\/|$)/i;
+const SD_DC_MARKER_RE = /^\s*dc(?:\.js)?\s*[:(]/i;
 const SD_SUMMARY_RE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}) — /;
 const SD_DEFAULTS = Object.freeze({
   defaultDelay: '3d',
@@ -35,10 +36,15 @@ const SD_DEFAULTS = Object.freeze({
   dryRun: true,
   logEnabled: true,
   contentLog: true,
+  hideTags: true,
   logCollection: SD_SCRATCHPAD_COLLECTION_GUID,
 });
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function matchesSdTagText(value) {
+  return SD_TAG_RE.test(String(value == null ? '' : value).trim());
+}
 
 function parseDuration(value) {
   const match = String(value == null ? '' : value).trim().match(/^(\d+)(m|h|d|w)$/i);
@@ -158,17 +164,18 @@ function classifyLine(line) {
   const emptyEligibleTypes = new Set(['', 'text', 'ulist', 'olist', 'empty', 'br', 'heading', 'quote']);
   if (!emptyEligibleTypes.has(type)) return Object.freeze({ empty: false, reason: 'type:' + type });
   const segments = line.segments || [];
+  const text = segments
+    .filter(segment => segment && segment.type !== 'hashtag')
+    .map(segment => typeof segment.text === 'string' ? segment.text : segment.text && segment.text.title || '')
+    .join('')
+    .trim();
+  if (SD_DC_MARKER_RE.test(text)) return Object.freeze({ empty: true, reason: 'dc-marker' });
   const semantic = new Set(['ref', 'datetime', 'linkobj', 'mention', 'image', 'file', 'transclusion']);
   for (const segment of segments) {
     if (semantic.has(String(segment && segment.type || '').toLowerCase())) {
       return Object.freeze({ empty: false, reason: 'segment:' + segment.type });
     }
   }
-  const text = segments
-    .filter(segment => segment && segment.type !== 'hashtag')
-    .map(segment => typeof segment.text === 'string' ? segment.text : segment.text && segment.text.title || '')
-    .join('')
-    .trim();
   if (!text) return Object.freeze({ empty: true, reason: 'blank-or-hashtag' });
   const attr = parseAttrLine(text);
   if (attr && !(attr[2] || '').trim()) return Object.freeze({ empty: true, reason: 'bare-attribute' });
@@ -340,6 +347,9 @@ function newReport(options) {
 
 class Plugin extends AppPlugin {
   onLoad() {
+    try { if (window.__sdHideObs) window.__sdHideObs.disconnect(); } catch (_) {}
+    try { if (window.__sdHideNavId) this.events.off(window.__sdHideNavId); } catch (_) {}
+    try { for (const node of document.querySelectorAll('.sd-tag-caret-line')) node.classList.remove('sd-tag-caret-line'); } catch (_) {}
     window.__SD_VERSION = SD_VERSION;
     let previousDashboardReport = null;
     try { previousDashboardReport = window.__sdInstance && window.__sdInstance._dashboardReport || null; } catch (_) {}
@@ -353,7 +363,7 @@ class Plugin extends AppPlugin {
     try { if (window.__sdCaretPoll) clearInterval(window.__sdCaretPoll); } catch (_) {}
     try { if (window.__sdStatusItem && window.__sdStatusItem.remove) window.__sdStatusItem.remove(); } catch (_) {}
     try { if (typeof window.__sdModalCancel === 'function') window.__sdModalCancel(); } catch (_) {}
-    for (const key of ['__sdDispose','__sdInterval','__sdFirstPass','__sdActivityHandler','__sdEventIds','__sdCommands','__sdCaretHandler','__sdCaretPoll','__sdStatusItem','__sdModalCancel','__sdPanelMount','__sdInstance']) { try { delete window[key]; } catch (_) {} }
+    for (const key of ['__sdDispose','__sdInterval','__sdFirstPass','__sdActivityHandler','__sdEventIds','__sdCommands','__sdCaretHandler','__sdCaretPoll','__sdStatusItem','__sdModalCancel','__sdPanelMount','__sdInstance','__sdHideObs','__sdHideNavId']) { try { delete window[key]; } catch (_) {} }
 
     console.log('%c[Self Destruct] v' + SD_VERSION + ' loaded — dry-run first, subtree-safe.', 'color:#ef4444;font-weight:700;font-size:12px');
     this.VERSION = SD_VERSION;
@@ -368,6 +378,11 @@ class Plugin extends AppPlugin {
     this._dashboardReport = previousDashboardReport && previousDashboardReport.schemaVersion === 1 ? previousDashboardReport : null;
     this._dashboardRefreshPromise = null;
     this._caretStash = null;
+    this._templateGuids = new Set();
+    this._templateGuidsReady = false;
+    this._hideObserver = null;
+    this._hideNavId = null;
+    this._tagCaretLineEl = null;
     this._quietWaiters = new Set();
     this._resurrected = this._loadResurrected();
     this._settings = this._loadSettings();
@@ -383,6 +398,7 @@ class Plugin extends AppPlugin {
     window.__sdInstance = this;
     this._subscribeUndeletes();
     this._installManagedStyle();
+    this._installTagHiding();
     this._registerDashboard();
     this._installCaretStash();
     this._registerCommands();
@@ -413,6 +429,9 @@ class Plugin extends AppPlugin {
     try { for (const command of this._commands || []) command && command.remove && command.remove(); } catch (_) {}
     try { if (this._caretHandler) { document.removeEventListener('mouseup', this._caretHandler); document.removeEventListener('keyup', this._caretHandler); } } catch (_) {}
     try { if (this._caretPoll) clearInterval(this._caretPoll); } catch (_) {}
+    try { if (this._hideObserver) this._hideObserver.disconnect(); } catch (_) {}
+    try { if (this._hideNavId) this.events.off(this._hideNavId); } catch (_) {}
+    try { if (this._tagCaretLineEl) this._tagCaretLineEl.classList.remove('sd-tag-caret-line'); } catch (_) {}
     try { if (this._statusItem && this._statusItem.remove) this._statusItem.remove(); } catch (_) {}
     try { if (typeof this._modalCancel === 'function') this._modalCancel(); } catch (_) {}
     for (const host of this._dashboardHosts || []) {
@@ -428,8 +447,9 @@ class Plugin extends AppPlugin {
     try { if (window.__SD_SWEEP === this._sweepGlobal) delete window.__SD_SWEEP; } catch (_) {}
     try { if (window.__SD_DRY === this._dryGlobal) delete window.__SD_DRY; } catch (_) {}
     if (typeof window !== 'undefined' && window.__sdInstance === this) {
-      for (const key of ['__sdDispose','__sdInterval','__sdFirstPass','__sdActivityHandler','__sdEventIds','__sdCommands','__sdCaretHandler','__sdCaretPoll','__sdStatusItem','__sdModalCancel','__sdPanelMount','__sdInstance']) { try { delete window[key]; } catch (_) {} }
+      for (const key of ['__sdDispose','__sdInterval','__sdFirstPass','__sdActivityHandler','__sdEventIds','__sdCommands','__sdCaretHandler','__sdCaretPoll','__sdStatusItem','__sdModalCancel','__sdPanelMount','__sdInstance','__sdHideObs','__sdHideNavId']) { try { delete window[key]; } catch (_) {} }
     }
+    try { document.body && document.body.classList.remove('sd-hide-tags'); } catch (_) {}
     if (fullUnload) { try { document.getElementById(SD_STYLE_ID)?.remove(); } catch (_) {} }
   }
 
@@ -454,6 +474,7 @@ class Plugin extends AppPlugin {
     merged.dryRun = stored.dryRun === undefined ? true : stored.dryRun === true;
     merged.logEnabled = stored.logEnabled === undefined ? true : stored.logEnabled === true;
     merged.contentLog = stored.contentLog === undefined ? true : stored.contentLog === true;
+    merged.hideTags = stored.hideTags === undefined ? true : stored.hideTags === true;
     merged.logCollection = String(merged.logCollection || SD_SCRATCHPAD_COLLECTION_GUID);
     return merged;
   }
@@ -561,9 +582,128 @@ class Plugin extends AppPlugin {
 .sd-modal .sd-input:focus { border-color:var(--button-primary-bg-color); outline:none; }
 .sd-modal .sd-btn { border:1px solid var(--cards-border-color); border-radius:7px; padding:6px 11px; background:var(--button-bg-color); color:var(--color-text-400); font:inherit; font-size:12px; cursor:pointer; }
 .sd-modal .sd-btn-primary { border-color:var(--button-primary-bg-color); background:var(--button-primary-bg-color); color:var(--cards-bg); font-weight:650; }
+body.sd-hide-tags .sd-tag-hide { display:none; }
+body.sd-hide-tags .listitem:hover .sd-tag-hide,body.sd-hide-tags .listitem.listitem-with-caret .sd-tag-hide,body.sd-hide-tags .listitem.sd-tag-caret-line .sd-tag-hide,body.sd-hide-tags .flowythymer-thread-target .sd-tag-hide { display:inline; }
 @media (max-width:620px) { .sd-widget .sd-header{display:block}.sd-widget .sd-badge{margin-top:10px}.sd-widget .sd-row{grid-template-columns:1fr}.sd-widget .sd-setting{grid-template-columns:1fr}.sd-widget .sd-toggle{justify-self:start} }
 `;
     } catch (error) { this._recordStandaloneError('style', error, null, null); }
+  }
+
+  _installTagHiding() {
+    window.__SD_HIDE_STATS = { stamped: 0, skippedTemplates: 0, fallbackSelectorUsed: false, lastScanMs: 0, scans: 0 };
+    this._applyHideTags(false);
+    try {
+      this._hideObserver = new MutationObserver(mutations => this._onHideMutations(mutations));
+      this._hideObserver.observe(document.body, { childList: true, subtree: true });
+      window.__sdHideObs = this._hideObserver;
+    } catch (error) { this._recordStandaloneError('hide-tags-observer', error, null, null); }
+    try {
+      this._hideNavId = this.events.on('panel.navigated', () => this._scanSdChips(document));
+      if (this._hideNavId) {
+        this._eventIds.push(this._hideNavId);
+        window.__sdHideNavId = this._hideNavId;
+      }
+    } catch (error) { this._recordStandaloneError('hide-tags-navigation', error, null, null); }
+    this._refreshTemplateGuids().catch(error => this._recordStandaloneError('hide-tags-templates', error, null, null));
+  }
+
+  _applyHideTags(scan) {
+    try { document.body && document.body.classList.toggle('sd-hide-tags', !!this._settings.hideTags); } catch (_) {}
+    if (scan && this._settings.hideTags) this._scanSdChips(document);
+  }
+
+  async _refreshTemplateGuids() {
+    const templateGuids = new Set();
+    const collections = await this.data.getAllCollections();
+    const templates = (collections || []).find(collection => {
+      try { return collection.getGuid() === SD_TEMPLATES_COLLECTION_GUID; } catch (_) { return false; }
+    });
+    if (templates) {
+      for (const record of await templates.getAllRecords()) if (record && record.guid) templateGuids.add(record.guid);
+    }
+    this._adoptTemplateGuids(templateGuids);
+    return templateGuids;
+  }
+
+  _adoptTemplateGuids(templateGuids) {
+    this._templateGuids = new Set(templateGuids || []);
+    this._templateGuidsReady = true;
+    this._scanSdChips(document);
+  }
+
+  _findSdChips(rootEl) {
+    if (!rootEl || typeof rootEl.querySelectorAll !== 'function') return [];
+    const primaryNodes = [];
+    if (rootEl.nodeType === 1 && rootEl.matches('.lineitem-hashtag')) primaryNodes.push(rootEl);
+    for (const element of rootEl.querySelectorAll('.lineitem-hashtag')) primaryNodes.push(element);
+    if (primaryNodes.length) {
+      this._lastFindUsedFallback = false;
+      return primaryNodes.filter(element => matchesSdTagText(element.textContent));
+    }
+
+    const fallback = [];
+    const considerLeaf = element => {
+      if (!element || element.nodeType !== 1 || element.childElementCount !== 0) return;
+      if (!element.closest('.listitem') || !matchesSdTagText(element.textContent)) return;
+      fallback.push(element);
+    };
+    considerLeaf(rootEl);
+    for (const element of rootEl.querySelectorAll('*')) considerLeaf(element);
+    this._lastFindUsedFallback = true;
+    return fallback;
+  }
+
+  _scanSdChips(rootEl) {
+    const startedAt = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+    let stamped = 0;
+    let skippedTemplates = 0;
+    let fallbackSelectorUsed = false;
+    try {
+      if (!this._templateGuidsReady) return;
+      const chips = this._findSdChips(rootEl);
+      fallbackSelectorUsed = this._lastFindUsedFallback === true;
+      for (const chip of chips) {
+        const record = chip.closest('.listview-items[data-guid]');
+        const recordGuid = record && record.getAttribute('data-guid');
+        if (recordGuid && this._templateGuids.has(recordGuid)) {
+          chip.classList.remove('sd-tag-hide');
+          skippedTemplates++;
+          continue;
+        }
+        chip.classList.add('sd-tag-hide');
+        stamped++;
+      }
+    } finally {
+      const finishedAt = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+      const stats = window.__SD_HIDE_STATS || { stamped: 0, skippedTemplates: 0, fallbackSelectorUsed: false, lastScanMs: 0, scans: 0 };
+      stats.stamped = stamped;
+      stats.skippedTemplates = skippedTemplates;
+      stats.fallbackSelectorUsed = fallbackSelectorUsed;
+      stats.lastScanMs = Math.max(0, finishedAt - startedAt);
+      stats.scans = Number(stats.scans || 0) + 1;
+      window.__SD_HIDE_STATS = stats;
+    }
+  }
+
+  _hideMutationRoot(node) {
+    const element = node && node.nodeType === 1 ? node : node && node.parentElement;
+    if (!element) return null;
+    if (element.matches('.listitem') || element.closest('.listitem')) return element;
+    return null;
+  }
+
+  _onHideMutations(mutations) {
+    if (!this._templateGuidsReady) return;
+    const roots = new Set();
+    for (const mutation of mutations || []) {
+      const target = this._hideMutationRoot(mutation.target);
+      if (target) roots.add(target);
+      for (const node of mutation.addedNodes || []) {
+        const added = this._hideMutationRoot(node);
+        if (added) roots.add(added);
+      }
+    }
+    for (const root of roots) this._scanSdChips(root);
   }
 
   _registerDashboard() {
@@ -697,6 +837,7 @@ class Plugin extends AppPlugin {
       '<label class="sd-setting"><span>Default delay</span><input class="sd-input" name="defaultDelay" type="text" value="' + this._escapeHtml(this._settings.defaultDelay) + '" spellcheck="false" aria-label="Default delay"></label>' +
       '<label class="sd-setting"><span>Line-write budget</span><input class="sd-input" name="lineWriteBudget" type="number" min="1" max="' + SD_HARD_WRITE_CAP + '" value="' + this._escapeHtml(this._settings.lineWriteBudget) + '"></label>' +
       '<label class="sd-setting"><span>Dry-run by default</span><input class="sd-toggle" name="dryRun" type="checkbox" ' + (this._settings.dryRun ? 'checked' : '') + '></label>' +
+      '<label class="sd-setting"><span>Hide #sd tags in documents</span><input class="sd-toggle" name="hideTags" type="checkbox" ' + (this._settings.hideTags ? 'checked' : '') + '></label>' +
       '<label class="sd-setting"><span>Log enabled</span><input class="sd-toggle" name="logEnabled" type="checkbox" ' + (this._settings.logEnabled ? 'checked' : '') + '></label>' +
       '<label class="sd-setting"><span>Include deleted content in log</span><input class="sd-toggle" name="contentLog" type="checkbox" ' + (this._settings.contentLog ? 'checked' : '') + '></label>' +
       '<label class="sd-setting"><span>Log collection GUID</span><input class="sd-input" name="logCollection" type="text" value="' + this._escapeHtml(this._settings.logCollection) + '" spellcheck="false"></label>' +
@@ -768,8 +909,9 @@ class Plugin extends AppPlugin {
       if (guid) this._saveSettings({ logCollection: guid });
       return;
     }
-    if (['dryRun','logEnabled','contentLog'].includes(input.name)) {
+    if (['dryRun','hideTags','logEnabled','contentLog'].includes(input.name)) {
       this._saveSettings({ [input.name]: !!input.checked });
+      if (input.name === 'hideTags') this._applyHideTags(true);
       this._paintDashboards();
     }
   }
@@ -861,6 +1003,15 @@ class Plugin extends AppPlugin {
         onSelected: () => { this._requestSweep({ manual: true, dryRun: true, source: 'dry-run' }).catch(() => {}); },
       }));
       this._commands.push(this.ui.addCommandPaletteCommand({
+        label: 'Self Destruct: Toggle tag hiding',
+        icon: 'ti-eye-off',
+        onSelected: () => {
+          this._saveSettings({ hideTags: !this._settings.hideTags });
+          this._applyHideTags(true);
+          this._paintDashboards();
+        },
+      }));
+      this._commands.push(this.ui.addCommandPaletteCommand({
         label: 'Tag current line: #sd',
         icon: 'ti-tag',
         onSelected: () => { this._tagCurrentLine('#sd').catch(() => {}); },
@@ -898,9 +1049,24 @@ class Plugin extends AppPlugin {
   _stashCaretGuid() {
     if (this._disposed) return null;
     const guid = this._currentCaretGuid();
+    this._syncTagCaretLine(guid);
     if (!guid) return null;
     this._caretStash = { guid: String(guid), ts: Date.now() };
     return this._caretStash;
+  }
+
+  _syncTagCaretLine(guid) {
+    let next = null;
+    if (guid) {
+      try { next = document.querySelector('.listitem[data-guid="' + CSS.escape(String(guid)) + '"]'); } catch (_) {}
+    }
+    if (this._tagCaretLineEl && this._tagCaretLineEl !== next) {
+      try { this._tagCaretLineEl.classList.remove('sd-tag-caret-line'); } catch (_) {}
+    }
+    if (next) {
+      try { next.classList.add('sd-tag-caret-line'); } catch (_) {}
+    }
+    this._tagCaretLineEl = next;
   }
 
   _stashedCaretGuid() {
@@ -1123,6 +1289,7 @@ class Plugin extends AppPlugin {
     if (templates) {
       for (const record of await templates.getAllRecords()) if (record && record.guid) templateRecords.add(record.guid);
     }
+    this._adoptTemplateGuids(templateRecords);
     const logRecord = await this._findLogRecord(false, context);
     return { lines: [], searchCapped: false, templateRecords, logGuid: logRecord && logRecord.guid || null };
   }
@@ -1141,7 +1308,7 @@ class Plugin extends AppPlugin {
       const line = await this._freshLineByGuid(recordGuid, lineGuid);
       if (!line) return false;
       const discovery = await this._minimalDiscovery(context);
-      const result = await this._defuse(line, discovery, context, { manual: true });
+      const result = await this._defuse(line, discovery, context, { manual: true, ignoreCaret: true });
       return !!(result && result.action && result.action.ok);
     } catch (error) {
       this._recordStandaloneError('manual-defuse', error, lineGuid, recordGuid);
@@ -1153,10 +1320,23 @@ class Plugin extends AppPlugin {
     const context = this._newActionContext('manual-trash');
     try {
       const line = await this._freshLineByGuid(recordGuid, lineGuid);
-      if (!line) return false;
+      if (!line) {
+        this._toast('Self Destruct', 'Trash now was blocked: line not found.');
+        return false;
+      }
       const discovery = await this._minimalDiscovery(context);
-      const result = await this._destroyLine(line, discovery, context, { bypassExpiry: true });
-      if (!result.completed) this._toast('Self Destruct', 'Trash now was blocked by a safety check.');
+      const result = await this._destroyLine(line, discovery, context, { bypassExpiry: true, ignoreCaret: true });
+      if (!result.completed) {
+        const verdict = result && result.verdict;
+        const reason = verdict && verdict.reason;
+        const status = verdict && verdict.status;
+        const detail = status === 'keep' || reason === 'keep-veto'
+          ? '#keep in subtree'
+          : reason === 'missing'
+            ? 'line not found'
+            : 'safety check (' + String(status || 'skip') + ': ' + String(reason || 'unknown') + ')';
+        this._toast('Self Destruct', 'Trash now was blocked: ' + detail + '.');
+      }
       return !!result.completed;
     } catch (error) {
       this._recordStandaloneError('manual-trash', error, lineGuid, recordGuid);
@@ -1402,6 +1582,7 @@ class Plugin extends AppPlugin {
     if (templates) {
       for (const record of await templates.getAllRecords()) if (record && record.guid) templateRecords.add(record.guid);
     }
+    this._adoptTemplateGuids(templateRecords);
     const logRecord = await this._findLogRecord(false, context);
     return {
       lines: Array.from(dedup.values()),
@@ -1436,7 +1617,7 @@ class Plugin extends AppPlugin {
     return { basis: null, at: null, reason: 'no-ts' };
   }
 
-  async _evaluateLine(line, discovery, now) {
+  async _evaluateLine(line, discovery, now, options) {
     const record = this._lineRecord(line);
     const base = {
       lineGuid: line && line.guid || '',
@@ -1482,9 +1663,11 @@ class Plugin extends AppPlugin {
       return frozenVerdict(Object.assign(common, treeFields, { status: 'keep', reason: 'keep-veto' }));
     }
     if (now < deadline) return frozenVerdict(Object.assign(common, treeFields, { status: 'wait', reason: 'not-expired' }));
-    const caretGuid = this._currentCaretGuid();
-    if (caretGuid && [line].concat(descendants).some(item => item.guid === caretGuid)) {
-      return frozenVerdict(Object.assign(common, treeFields, { status: 'skip', reason: 'caret' }));
+    if (!(options && options.ignoreCaret)) {
+      const caretGuid = this._currentCaretGuid();
+      if (caretGuid && [line].concat(descendants).some(item => item.guid === caretGuid)) {
+        return frozenVerdict(Object.assign(common, treeFields, { status: 'skip', reason: 'caret' }));
+      }
     }
     if ([line].concat(descendants).some(item => this._resurrected.has(item.guid))) {
       return frozenVerdict(Object.assign(common, treeFields, { status: 'defuse', reason: 'resurrected', empty: null }));
@@ -1503,14 +1686,14 @@ class Plugin extends AppPlugin {
     return (lines || []).find(line => line.guid === originalLine.guid) || null;
   }
 
-  async _reverify(originalLine, discovery) {
-    return (await this._reverifyState(originalLine, discovery)).verdict;
+  async _reverify(originalLine, discovery, options) {
+    return (await this._reverifyState(originalLine, discovery, options)).verdict;
   }
 
-  async _reverifyState(originalLine, discovery) {
+  async _reverifyState(originalLine, discovery, options) {
     const fresh = await this._freshRoot(originalLine);
     if (!fresh) return { fresh: null, verdict: this._baseSkip(originalLine, 'missing') };
-    return { fresh, verdict: await this._evaluateLine(fresh, discovery, Date.now()) };
+    return { fresh, verdict: await this._evaluateLine(fresh, discovery, Date.now(), options) };
   }
 
   _tripCircuit(context, reason) {
@@ -1554,13 +1737,13 @@ class Plugin extends AppPlugin {
   async _manualDeleteVerdict(state, discovery, options) {
     const verdict = state && state.verdict;
     if (options && options.bypassExpiry && state.fresh && verdict && verdict.status === 'wait' && Number.isFinite(verdict.deadline)) {
-      return await this._evaluateLine(state.fresh, discovery, Math.max(Date.now(), verdict.deadline));
+      return await this._evaluateLine(state.fresh, discovery, Math.max(Date.now(), verdict.deadline), options);
     }
     return verdict;
   }
 
   async _destroyLine(originalLine, discovery, context, options) {
-    let state = await this._reverifyState(originalLine, discovery);
+    let state = await this._reverifyState(originalLine, discovery, options);
     let verdict = await this._manualDeleteVerdict(state, discovery, options);
     const deleteVerdict = verdict;
     const deletedGuids = [];
@@ -1575,7 +1758,7 @@ class Plugin extends AppPlugin {
         lastQuietCheckAt = deletedGuids.length;
         if (!await this._waitForEditorQuiet()) break;
       }
-      state = await this._reverifyState(originalLine, discovery);
+      state = await this._reverifyState(originalLine, discovery, options);
       verdict = await this._manualDeleteVerdict(state, discovery, options);
       if (verdict.status === 'defuse' && verdict.reason === 'content' &&
           deleteVerdict.empty === true && verdict.subtreeSize === 1 && deletedGuids.length > 0) {
@@ -1611,11 +1794,10 @@ class Plugin extends AppPlugin {
   }
 
   async _defuse(originalLine, discovery, context, options) {
-    const state = await this._reverifyState(originalLine, discovery);
+    const state = await this._reverifyState(originalLine, discovery, options);
     let verdict = state.verdict;
     const manuallyDefusable = options && options.manual && state.fresh && this._sdTags(state.fresh).length && (
-      ['malformed','no-ts','wait','keep','delete','defuse'].includes(verdict.status) ||
-      (verdict.status === 'skip' && verdict.reason === 'caret')
+      ['malformed','no-ts','wait','keep','delete','defuse'].includes(verdict.status)
     );
     if (manuallyDefusable && verdict.status !== 'defuse') verdict = this._replaceVerdict(verdict, { status: 'defuse', reason: 'manual-defuse' });
     if (verdict.status !== 'defuse') return { verdict, action: { kind: 'defuse', ok: false, writes: 0, content: [] } };
@@ -1811,5 +1993,6 @@ if (typeof module !== 'undefined' && module.exports) {
     parseDuration,
     parseAttrLine,
     lineText,
+    matchesSdTagText,
   });
 }
