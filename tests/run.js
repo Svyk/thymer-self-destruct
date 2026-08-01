@@ -4,6 +4,8 @@ global.AppPlugin = class AppPlugin {};
 global.window = {};
 
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 const {
   parseSdTag,
   mergeSdTags,
@@ -38,6 +40,13 @@ function hashtag(value) { return { type: 'hashtag', text: value }; }
 function line(segments, type = 'ulist', status = null) {
   return { type, segments, getTaskStatus: () => status };
 }
+
+test('runtime and manifest identify the v0.3.2 caret-decoration repair release', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'plugin.js'), 'utf8');
+  const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'plugin.json'), 'utf8'));
+  assert.strictEqual(manifest.version, '0.3.2');
+  assert.ok(source.includes("const SD_VERSION = '0.3.2';"));
+});
 
 test('parseDuration accepts minutes', () => assert.strictEqual(parseDuration('30m'), 1800000));
 test('parseDuration accepts uppercase weeks', () => assert.strictEqual(parseDuration('2W'), 1209600000));
@@ -156,6 +165,40 @@ test('twenty unchanged caret-line bursts emit zero Self Destruct class writes', 
   assert.strictEqual(classWrites, 0);
   assert.strictEqual(row.classList.contains('sd-tag-caret-line'), true);
   assert.strictEqual(chip.classList.contains('sd-tag-hide'), true);
+});
+
+test('caret stash re-applies an externally stripped caret-line class on the same node', () => {
+  const lineGuid = '1SDCARETREPAIRABCDEFGHIJKL';
+  let pluginClassWrites = 0;
+  const values = new Set(['sd-tag-caret-line']);
+  const row = {
+    isConnected: true,
+    classList: {
+      contains(value) { return values.has(value); },
+      add(value) { pluginClassWrites++; values.add(value); },
+      remove(value) { pluginClassWrites++; values.delete(value); },
+    },
+  };
+  const previousDocument = global.document;
+  const previousCss = global.CSS;
+  global.document = { querySelector: () => row };
+  global.CSS = { escape: value => String(value) };
+  try {
+    const p = Object.create(Plugin.prototype);
+    p._disposed = false;
+    p._tagCaretLineEl = row;
+    p._tagCaretLineGuid = lineGuid;
+    p._currentCaretGuid = () => lineGuid;
+
+    values.delete('sd-tag-caret-line'); // external in-place renderer mutation
+    p._stashCaretGuid();
+
+    assert.strictEqual(pluginClassWrites, 1);
+    assert.strictEqual(row.classList.contains('sd-tag-caret-line'), true);
+  } finally {
+    global.document = previousDocument;
+    global.CSS = previousCss;
+  }
 });
 
 console.log('PASS ' + passed + ' tests');

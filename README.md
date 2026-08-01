@@ -1,8 +1,11 @@
 # Thymer Self Destruct
 
-Self Destruct is a Thymer app plugin that expires tagged lines and their subtrees. Version 0.3.1 includes the safety engine, dashboard, tagging and manual actions, logging, forensic globals, and flash-free document tag hiding.
+Self Destruct is a Thymer app plugin that expires tagged lines and their subtrees. Version 0.3.2 includes the safety engine, dashboard, tagging and manual actions, logging, forensic globals, and flash-free document tag hiding.
 
 ## Release notes
+
+v0.3.2 repairs a caret-line decorator if an external renderer strips `sd-tag-caret-line` in place.
+The next caret stash re-applies the missing class even when the same connected node and GUID remain.
 
 v0.3.1 makes caret-line and hidden-tag decorator classes conditional. The 400 ms caret poll and
 mutation-driven tag scanner now write only when classification actually changes; stable decorated

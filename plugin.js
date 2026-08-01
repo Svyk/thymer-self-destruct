@@ -1,6 +1,6 @@
 'use strict';
 
-const SD_VERSION = '0.3.1';
+const SD_VERSION = '0.3.2';
 const SD_WORKSPACE_GUID = 'WEJ9EZW6ADT58SJC3EQMNETSW6';
 const SD_TEMPLATES_COLLECTION_GUID = '1DEGAQTQARK8MKNAFZ9D1MY16W';
 const SD_SCRATCHPAD_COLLECTION_GUID = '1G8F9FFY4XFXKA2MBGE2FN39B3';
@@ -1068,7 +1068,9 @@ body.sd-hide-tags .listitem:hover .sd-tag-hide,body.sd-hide-tags .listitem.listi
   _syncTagCaretLine(guid) {
     const nextGuid = guid ? String(guid) : null;
     if (this._tagCaretLineGuid === nextGuid
-        && (!nextGuid || (this._tagCaretLineEl && this._tagCaretLineEl.isConnected !== false))) return;
+        && (!nextGuid || (this._tagCaretLineEl
+          && this._tagCaretLineEl.isConnected !== false
+          && this._tagCaretLineEl.classList.contains('sd-tag-caret-line')))) return;
     let next = null;
     if (nextGuid) {
       try { next = document.querySelector('.listitem[data-guid="' + CSS.escape(nextGuid) + '"]'); } catch (_) {}
