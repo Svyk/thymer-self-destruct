@@ -18,6 +18,7 @@ const {
   parseAttrLine,
   lineText,
   matchesSdTagText,
+  Plugin,
 } = require('../plugin.js');
 
 let passed = 0;
@@ -122,5 +123,39 @@ test('formatCountdown reports sub-minute', () => assert.strictEqual(formatCountd
 test('formatCountdown reports two largest units', () => assert.strictEqual(formatCountdown(parseDuration('1w') + parseDuration('2d') + parseDuration('3h')), '1w 2d'));
 test('formatCountdown reports hours and minutes', () => assert.strictEqual(formatCountdown(parseDuration('2h') + parseDuration('5m')), '2h 5m'));
 test('formatCountdown reports unknown', () => assert.strictEqual(formatCountdown(Number.NaN), 'unknown'));
+
+test('twenty unchanged caret-line bursts emit zero Self Destruct class writes', () => {
+  const lineGuid = '1SDZEROWRITEBURSTABCDEFGHI';
+  let classWrites = 0;
+  const makeClassList = values => ({
+    values: new Set(values),
+    contains(value) { return this.values.has(value); },
+    add(value) { classWrites++; this.values.add(value); },
+    remove(value) { classWrites++; this.values.delete(value); },
+  });
+  const row = { isConnected: true, classList: makeClassList(['sd-tag-caret-line']) };
+  const chip = {
+    classList: makeClassList(['sd-tag-hide']),
+    closest(selector) { return selector === '.listview-items[data-guid]' ? null : row; },
+  };
+  const p = Object.create(Plugin.prototype);
+  p._disposed = false;
+  p._tagCaretLineEl = row;
+  p._tagCaretLineGuid = lineGuid;
+  p._currentCaretGuid = () => lineGuid;
+  p._templateGuidsReady = true;
+  p._templateGuids = new Set();
+  p._findSdChips = () => [chip];
+  p._lastFindUsedFallback = false;
+
+  for (let i = 0; i < 20; i++) {
+    p._stashCaretGuid();
+    p._scanSdChips(row);
+  }
+
+  assert.strictEqual(classWrites, 0);
+  assert.strictEqual(row.classList.contains('sd-tag-caret-line'), true);
+  assert.strictEqual(chip.classList.contains('sd-tag-hide'), true);
+});
 
 console.log('PASS ' + passed + ' tests');

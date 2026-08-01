@@ -1,6 +1,6 @@
 'use strict';
 
-const SD_VERSION = '0.3.0';
+const SD_VERSION = '0.3.1';
 const SD_WORKSPACE_GUID = 'WEJ9EZW6ADT58SJC3EQMNETSW6';
 const SD_TEMPLATES_COLLECTION_GUID = '1DEGAQTQARK8MKNAFZ9D1MY16W';
 const SD_SCRATCHPAD_COLLECTION_GUID = '1G8F9FFY4XFXKA2MBGE2FN39B3';
@@ -383,6 +383,7 @@ class Plugin extends AppPlugin {
     this._hideObserver = null;
     this._hideNavId = null;
     this._tagCaretLineEl = null;
+    this._tagCaretLineGuid = null;
     this._quietWaiters = new Set();
     this._resurrected = this._loadResurrected();
     this._settings = this._loadSettings();
@@ -582,7 +583,7 @@ class Plugin extends AppPlugin {
 .sd-modal .sd-input:focus { border-color:var(--button-primary-bg-color); outline:none; }
 .sd-modal .sd-btn { border:1px solid var(--cards-border-color); border-radius:7px; padding:6px 11px; background:var(--button-bg-color); color:var(--color-text-400); font:inherit; font-size:12px; cursor:pointer; }
 .sd-modal .sd-btn-primary { border-color:var(--button-primary-bg-color); background:var(--button-primary-bg-color); color:var(--cards-bg); font-weight:650; }
-body.sd-hide-tags .sd-tag-hide { display:none; }
+body.sd-hide-tags .sd-tag-hide { display:none; transition:none!important; }
 body.sd-hide-tags .listitem:hover .sd-tag-hide,body.sd-hide-tags .listitem.listitem-with-caret .sd-tag-hide,body.sd-hide-tags .listitem.sd-tag-caret-line .sd-tag-hide,body.sd-hide-tags .flowythymer-thread-target .sd-tag-hide { display:inline; }
 @media (max-width:620px) { .sd-widget .sd-header{display:block}.sd-widget .sd-badge{margin-top:10px}.sd-widget .sd-row{grid-template-columns:1fr}.sd-widget .sd-setting{grid-template-columns:1fr}.sd-widget .sd-toggle{justify-self:start} }
 `;
@@ -608,8 +609,17 @@ body.sd-hide-tags .listitem:hover .sd-tag-hide,body.sd-hide-tags .listitem.listi
   }
 
   _applyHideTags(scan) {
-    try { document.body && document.body.classList.toggle('sd-hide-tags', !!this._settings.hideTags); } catch (_) {}
+    try { this._setClassState(document.body, 'sd-hide-tags', !!this._settings.hideTags); } catch (_) {}
     if (scan && this._settings.hideTags) this._scanSdChips(document);
+  }
+
+  _setClassState(element, className, enabled) {
+    if (!element || !element.classList) return false;
+    const hasClass = element.classList.contains(className);
+    if (hasClass === !!enabled) return false;
+    if (enabled) element.classList.add(className);
+    else element.classList.remove(className);
+    return true;
   }
 
   async _refreshTemplateGuids() {
@@ -666,11 +676,11 @@ body.sd-hide-tags .listitem:hover .sd-tag-hide,body.sd-hide-tags .listitem.listi
         const record = chip.closest('.listview-items[data-guid]');
         const recordGuid = record && record.getAttribute('data-guid');
         if (recordGuid && this._templateGuids.has(recordGuid)) {
-          chip.classList.remove('sd-tag-hide');
+          this._setClassState(chip, 'sd-tag-hide', false);
           skippedTemplates++;
           continue;
         }
-        chip.classList.add('sd-tag-hide');
+        this._setClassState(chip, 'sd-tag-hide', true);
         stamped++;
       }
     } finally {
@@ -1056,17 +1066,21 @@ body.sd-hide-tags .listitem:hover .sd-tag-hide,body.sd-hide-tags .listitem.listi
   }
 
   _syncTagCaretLine(guid) {
+    const nextGuid = guid ? String(guid) : null;
+    if (this._tagCaretLineGuid === nextGuid
+        && (!nextGuid || (this._tagCaretLineEl && this._tagCaretLineEl.isConnected !== false))) return;
     let next = null;
-    if (guid) {
-      try { next = document.querySelector('.listitem[data-guid="' + CSS.escape(String(guid)) + '"]'); } catch (_) {}
+    if (nextGuid) {
+      try { next = document.querySelector('.listitem[data-guid="' + CSS.escape(nextGuid) + '"]'); } catch (_) {}
     }
     if (this._tagCaretLineEl && this._tagCaretLineEl !== next) {
-      try { this._tagCaretLineEl.classList.remove('sd-tag-caret-line'); } catch (_) {}
+      try { this._setClassState(this._tagCaretLineEl, 'sd-tag-caret-line', false); } catch (_) {}
     }
     if (next) {
-      try { next.classList.add('sd-tag-caret-line'); } catch (_) {}
+      try { this._setClassState(next, 'sd-tag-caret-line', true); } catch (_) {}
     }
     this._tagCaretLineEl = next;
+    this._tagCaretLineGuid = nextGuid;
   }
 
   _stashedCaretGuid() {
@@ -1994,5 +2008,6 @@ if (typeof module !== 'undefined' && module.exports) {
     parseAttrLine,
     lineText,
     matchesSdTagText,
+    Plugin,
   });
 }
